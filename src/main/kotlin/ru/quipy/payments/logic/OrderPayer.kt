@@ -44,8 +44,8 @@ class OrderPayer {
     )
 
     private val rateLimiter = TokenBucketRateLimiter(
-        rate = 20,
-        bucketMaxCapacity = 250,
+        rate = 15,
+        bucketMaxCapacity = 30,
         window = 1,
         timeUnit = TimeUnit.SECONDS
     )
