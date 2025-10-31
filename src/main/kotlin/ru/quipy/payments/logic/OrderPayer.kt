@@ -6,9 +6,13 @@ import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.stereotype.Service
 import ru.quipy.apigateway.TooManyRequestsError
 import ru.quipy.common.utils.CallerBlockingRejectedExecutionHandler
+import ru.quipy.common.utils.CompositeRateLimiter
+import ru.quipy.common.utils.LeakingBucketRateLimiter
 import ru.quipy.common.utils.NamedThreadFactory
+import ru.quipy.common.utils.SlidingWindowRateLimiter
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
+import java.time.Duration
 import java.util.*
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.ThreadPoolExecutor
@@ -37,8 +41,21 @@ class OrderPayer {
         CallerBlockingRejectedExecutionHandler()
     )
 
+    private val rateLimiter = CompositeRateLimiter(
+        rl1 = LeakingBucketRateLimiter(
+            rate = 11,
+            window = Duration.ofSeconds(1),
+            bucketSize = 11
+        ),
+        rl2 = SlidingWindowRateLimiter(
+            window = Duration.ofSeconds(1),
+            rate = 11,
+        )
+    )
+
+
     fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long {
-        if (paymentExecutor.queue.remainingCapacity() == 0) {
+        if (!rateLimiter.tick()) {
             throw TooManyRequestsError(1000)
         }
 
