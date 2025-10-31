@@ -41,16 +41,9 @@ class OrderPayer {
         CallerBlockingRejectedExecutionHandler()
     )
 
-    private val rateLimiter = CompositeRateLimiter(
-        rl1 = LeakingBucketRateLimiter(
-            rate = 11,
-            window = Duration.ofSeconds(1),
-            bucketSize = 11
-        ),
-        rl2 = SlidingWindowRateLimiter(
-            window = Duration.ofSeconds(1),
-            rate = 11,
-        )
+    private val rateLimiter = SlidingWindowRateLimiter(
+        window = Duration.ofSeconds(1),
+        rate = 11,
     )
 
 
