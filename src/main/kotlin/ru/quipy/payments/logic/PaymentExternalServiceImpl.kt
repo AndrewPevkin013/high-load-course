@@ -145,7 +145,6 @@ class PaymentExternalSystemAdapterImpl(
             Runtime.getRuntime().availableProcessors().coerceAtMost(4)
         ).apply {
             removeOnCancelPolicy = true
-            setExecuteExistingDelayedTasksAfterShutdownPolicy(false)
         }
     }
 
