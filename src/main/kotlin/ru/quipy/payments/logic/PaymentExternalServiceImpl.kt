@@ -28,30 +28,27 @@ class PaymentExternalSystemAdapterImpl(
 
 
     private val rps = properties.rateLimitPerSec;
-    private  val EXPECTED_PROCESSING_MS = properties.averageProcessingTime.toMillis();
-    private val IO_SLOTS: Int = ((rps * EXPECTED_PROCESSING_MS) / 1000.0 * 1.2).toInt()
+    private  val expectedProccesingTime = 20_000L;
+    private val ioSlots: Int = ((rps * expectedProccesingTime) / 1000.0 * 1.2).toInt()
 
     private  val logger = LoggerFactory.getLogger(PaymentExternalSystemAdapter::class.java)
     private   val emptyBody = RequestBody.create(null, ByteArray(0))
     private  val mapper = ObjectMapper().registerKotlinModule()
 
-
     private val serviceName = properties.serviceName
     private val accountName = properties.accountName
     private val parallelRequests = properties.parallelRequests
 
-
     private val dispatcher = okhttp3.Dispatcher().apply {
-        maxRequests = IO_SLOTS
-        maxRequestsPerHost = IO_SLOTS
+        maxRequests = ioSlots
+        maxRequestsPerHost = ioSlots
     }
-
 
     private val client = OkHttpClient.Builder()
         .dispatcher(dispatcher)
         .build()
 
-    private val semaphoreRef = AtomicReference(Semaphore(IO_SLOTS))
+    private val semaphoreRef = AtomicReference(Semaphore(ioSlots))
     private fun sem(): Semaphore = semaphoreRef.get()
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
@@ -75,7 +72,7 @@ class PaymentExternalSystemAdapterImpl(
                 it.logSubmission(success = true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
             }
 
-            val callTimeout = (EXPECTED_PROCESSING_MS + 2_000) // ~22s
+            val callTimeout = (expectedProccesingTime + 2_000) // ~22s
                 .coerceAtMost(remainingTime - 100)
             metricsReporter.updateCurrentTimeout(accountName, callTimeout)
 
