@@ -2,13 +2,11 @@ package ru.quipy.payments.logic
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
-import okhttp3.ConnectionPool
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Autowired
-import ru.quipy.common.utils.SlidingWindowRateLimiter
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
 import java.net.SocketTimeoutException
@@ -28,16 +26,15 @@ class PaymentExternalSystemAdapterImpl(
     @Autowired private val metricsReporter: MetricsReporter
 ) : PaymentExternalSystemAdapter {
 
-    companion object {
-        private const val TEST_RPS = 100
-        private const val EXPECTED_PROCESSING_MS = 20_000L
-        private val IO_SLOTS: Int = ((TEST_RPS * EXPECTED_PROCESSING_MS) / 1000.0 * 1.2).toInt()
 
+    private val rps = properties.rateLimitPerSec;
+    private  val EXPECTED_PROCESSING_MS = properties.averageProcessingTime.toMillis();
+    private val IO_SLOTS: Int = ((rps * EXPECTED_PROCESSING_MS) / 1000.0 * 1.2).toInt()
 
-        val logger = LoggerFactory.getLogger(PaymentExternalSystemAdapter::class.java)
-        val emptyBody = RequestBody.create(null, ByteArray(0))
-        val mapper = ObjectMapper().registerKotlinModule()
-    }
+    private  val logger = LoggerFactory.getLogger(PaymentExternalSystemAdapter::class.java)
+    private   val emptyBody = RequestBody.create(null, ByteArray(0))
+    private  val mapper = ObjectMapper().registerKotlinModule()
+
 
     private val serviceName = properties.serviceName
     private val accountName = properties.accountName
