@@ -29,10 +29,10 @@ class PaymentExternalSystemAdapterImpl(
 ) : PaymentExternalSystemAdapter {
 
     companion object {
-        private const val TEST_RPS = 100                      // ← жёстко под тест
-        private const val EXPECTED_PROCESSING_MS = 20_000L    // ← 20s под тест
+        private const val TEST_RPS = 100
+        private const val EXPECTED_PROCESSING_MS = 20_000L
         private val IO_SLOTS: Int = ((TEST_RPS * EXPECTED_PROCESSING_MS) / 1000.0 * 1.2).toInt()
-        // IO_SLOTS ≈ 2400
+
 
         val logger = LoggerFactory.getLogger(PaymentExternalSystemAdapter::class.java)
         val emptyBody = RequestBody.create(null, ByteArray(0))
@@ -43,42 +43,16 @@ class PaymentExternalSystemAdapterImpl(
     private val accountName = properties.accountName
     private val parallelRequests = properties.parallelRequests
 
-//    private val semaphore = Semaphore(parallelRequests)
 
     private val dispatcher = okhttp3.Dispatcher().apply {
         maxRequests = IO_SLOTS
         maxRequestsPerHost = IO_SLOTS
     }
 
-    @Volatile private var expectedProcessingMs: Long = 20_000
-
-    fun configureConcurrency(ioSlots: Int) {
-        // 1) OkHttp dispatcher — общий и per-host лимиты
-        dispatcher.maxRequests = ioSlots
-        dispatcher.maxRequestsPerHost = ioSlots
-
-        // 2) «Пересобираем» семафор на новое число слотов I/O
-        semaphoreRef.set(Semaphore(ioSlots))
-
-        logger.info("[$accountName] Concurrency tuned: ioSlots=$ioSlots")
-    }
-
-    /**
-     * ratePerSecond × processingTimeMillis ~= нужное число одновременных запросов (Little's Law)
-     * +20% запас, чтобы не упираться в лимиты из-за флуктуаций
-     */
-    fun applyTestParams(ratePerSecond: Int, processingTimeMillis: Long) {
-        expectedProcessingMs = processingTimeMillis
-        val inflight = (ratePerSecond * processingTimeMillis / 1_000.0).toInt() // напр., 100 * 20_000ms = 2000
-        val ioSlots = maxOf(64, (inflight * 1.2).toInt())                      // ~2400 для твоего кейса
-        configureConcurrency(ioSlots)
-    }
-
 
     private val client = OkHttpClient.Builder()
         .dispatcher(dispatcher)
         .build()
-
 
     private val semaphoreRef = AtomicReference(Semaphore(IO_SLOTS))
     private fun sem(): Semaphore = semaphoreRef.get()
@@ -95,9 +69,7 @@ class PaymentExternalSystemAdapterImpl(
             }
 
             val semaphore = sem()
-            // конкуренция I/O
             if (!semaphore.tryAcquire()) {
-                // если не хватает слотов — быстрый фэйл (или попробовать чуть подождать)
                 recordFinalFailure(paymentId, paymentStartedAt, "No I/O slots")
                 return
             }
@@ -148,7 +120,6 @@ class PaymentExternalSystemAdapterImpl(
                             ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, "Parse error")
                         }
 
-                        val callMs = msSince(started)
 
                         if (it.code == 200 && body.result) {
                             paymentESService.update(paymentId) {
@@ -179,7 +150,6 @@ class PaymentExternalSystemAdapterImpl(
     }
 
     object Schedulers {
-        // маленький пул, т.к. задачи только "подождать и запланировать ретрай"
         val backoff: ScheduledExecutorService = ScheduledThreadPoolExecutor(
             Runtime.getRuntime().availableProcessors().coerceAtMost(4)
         ).apply {
@@ -189,7 +159,7 @@ class PaymentExternalSystemAdapterImpl(
     }
 
 
-    // Неблокирующий бэкофф (через общий планировщик, можно взять из Spring TaskScheduler)
+    // Неблокирующий бэкофф (через общий планировщик
     private fun scheduleBackoff(attempt: Int, action: () -> Unit) {
         val backoff = when (attempt) { 1 -> 100L; 2 -> 200L; else -> 400L }
         Schedulers.backoff.schedule(action, backoff, TimeUnit.MILLISECONDS)
