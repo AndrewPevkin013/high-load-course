@@ -16,7 +16,6 @@ import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.ScheduledThreadPoolExecutor
 import java.util.concurrent.Semaphore
 import java.util.concurrent.TimeUnit
-import java.util.concurrent.atomic.AtomicReference
 
 class PaymentExternalSystemAdapterImpl(
     private val properties: PaymentAccountProperties,
@@ -48,8 +47,7 @@ class PaymentExternalSystemAdapterImpl(
         .dispatcher(dispatcher)
         .build()
 
-    private val semaphoreRef = AtomicReference(Semaphore(ioSlots))
-    private fun sem(): Semaphore = semaphoreRef.get()
+    private val semaphore = Semaphore(ioSlots)
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         val maxAttempts = 3
@@ -62,7 +60,6 @@ class PaymentExternalSystemAdapterImpl(
                 return
             }
 
-            val semaphore = sem()
             if (!semaphore.tryAcquire()) {
                 recordFinalFailure(paymentId, paymentStartedAt, "No I/O slots")
                 return
