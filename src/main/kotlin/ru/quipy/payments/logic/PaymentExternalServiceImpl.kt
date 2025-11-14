@@ -7,6 +7,7 @@ import okhttp3.Request
 import okhttp3.RequestBody
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Autowired
+import ru.quipy.common.utils.SlidingWindowRateLimiter
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
 import java.net.SocketTimeoutException
@@ -38,6 +39,11 @@ class PaymentExternalSystemAdapterImpl(
     private val accountName = properties.accountName
     private val parallelRequests = properties.parallelRequests
 
+    private val rateLimiter = SlidingWindowRateLimiter(
+        rate = properties.rateLimitPerSec.toLong(),
+        window = Duration.ofSeconds(1)
+    )
+
     private val dispatcher = okhttp3.Dispatcher().apply {
         maxRequests = ioSlots
         maxRequestsPerHost = ioSlots
@@ -47,7 +53,7 @@ class PaymentExternalSystemAdapterImpl(
         .dispatcher(dispatcher)
         .build()
 
-    private val semaphore = Semaphore(ioSlots)
+    private val semaphore = Semaphore(parallelRequests)
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         val maxAttempts = 3
@@ -57,6 +63,12 @@ class PaymentExternalSystemAdapterImpl(
             val remainingTime = deadline - now()
             if (remainingTime < 200) {
                 recordFinalFailure(paymentId, paymentStartedAt, "Insufficient time: ${remainingTime}ms")
+                return
+            }
+
+            val toBlock = deadline - System.currentTimeMillis()
+            if (!rateLimiter.tickBlocking(Duration.ofMillis(toBlock))) {
+                recordFinalFailure(paymentId, paymentStartedAt, "Rate limit exceeded")
                 return
             }
 
@@ -97,7 +109,6 @@ class PaymentExternalSystemAdapterImpl(
                         return
                     }
                     metricsReporter.incrementRetry(accountName, RetryCause.TIMEOUT)
-                    // без Thread.sleep: планируем ретрай неблокирующе
                     scheduleBackoff(at) { attempt(at + 1) }
                     semaphore.release()
                 }
@@ -149,7 +160,6 @@ class PaymentExternalSystemAdapterImpl(
     }
 
 
-    // Неблокирующий бэкофф через общий планировщик
     private fun scheduleBackoff(attempt: Int, action: () -> Unit) {
         val backoff = when (attempt) { 1 -> 100L; 2 -> 200L; else -> 400L }
         Schedulers.backoff.schedule(action, backoff, TimeUnit.MILLISECONDS)
