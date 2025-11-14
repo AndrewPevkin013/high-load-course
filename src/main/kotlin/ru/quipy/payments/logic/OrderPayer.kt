@@ -43,7 +43,7 @@ class OrderPayer {
         CallerBlockingRejectedExecutionHandler()
     )
 
-    private val rateLimiter = SlidingWindowRateLimiter(8, Duration.ofSeconds(1))
+    private val rateLimiter = SlidingWindowRateLimiter(100, Duration.ofSeconds(1))
 
     fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long {
         val toBlock = deadline - System.currentTimeMillis()
