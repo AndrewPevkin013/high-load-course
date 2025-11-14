@@ -153,7 +153,7 @@ class PaymentExternalSystemAdapterImpl(
     }
 
 
-    // Неблокирующий бэкофф (через общий планировщик
+    // Неблокирующий бэкофф через общий планировщик
     private fun scheduleBackoff(attempt: Int, action: () -> Unit) {
         val backoff = when (attempt) { 1 -> 100L; 2 -> 200L; else -> 400L }
         Schedulers.backoff.schedule(action, backoff, TimeUnit.MILLISECONDS)
