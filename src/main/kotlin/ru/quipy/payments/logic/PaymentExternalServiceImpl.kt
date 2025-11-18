@@ -34,7 +34,11 @@ class PaymentExternalSystemAdapterImpl(
     private val accountName = properties.accountName
     private val parallelRequests = properties.parallelRequests
 
+    // ограничение параллельности – как у другой команды через OngoingWindow,
+    // только у нас это обычный Semaphore
     private val semaphore = Semaphore(parallelRequests)
+
+    // простой sync-клиент, как и был
     private val client = OkHttpClient.Builder()
         .connectTimeout(2500, TimeUnit.MILLISECONDS)
         .readTimeout(1800, TimeUnit.MILLISECONDS)
@@ -42,114 +46,150 @@ class PaymentExternalSystemAdapterImpl(
         .callTimeout(3500, TimeUnit.MILLISECONDS)
         .build()
 
+    // тот же sliding-window, но используем tick() + ожидание до дедлайна,
+    // как waitRateLimitOrTimeout у другой команды
     private val rateLimiter = SlidingWindowRateLimiter(
         rate = properties.rateLimitPerSec.toLong(),
         window = Duration.ofSeconds(1)
     )
 
+    private fun waitRateLimitOrTimeout(deadline: Long): Boolean {
+        while (!rateLimiter.tick()) {
+            if (now() >= deadline) {
+                return false
+            }
+            Thread.sleep(5)
+        }
+        return true
+    }
+
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
-        var attempt = 0
         val maxAttempts = 3
 
-        while (attempt < maxAttempts) {
-            attempt++
+        // как у другой команды – один transactionId и один logSubmission на весь платёж
+        val transactionId = UUID.randomUUID()
+        val createdAt = now()
 
-            val remainingTime = deadline - System.currentTimeMillis()
-            if (remainingTime < 200) {
-                recordFinalFailure(paymentId, paymentStartedAt, "Insufficient time: ${remainingTime}ms")
+        paymentESService.update(paymentId) {
+            it.logSubmission(
+                success = true,
+                transactionId = transactionId,
+                startedAt = createdAt,
+                spentInQueueDuration = Duration.ofMillis(createdAt - paymentStartedAt)
+            )
+        }
+
+        // сначала проверяем, успеем ли вообще что-то делать
+        var remainingTime = deadline - now()
+        if (remainingTime < 200) {
+            recordProcessingFailure(paymentId, transactionId, "Insufficient time: ${remainingTime}ms")
+            return
+        }
+
+        // ограничение по параллельности – захватываем слот один раз на весь платёж
+        val acquired = semaphore.tryAcquire(remainingTime, TimeUnit.MILLISECONDS)
+        if (!acquired) {
+            recordProcessingFailure(paymentId, transactionId, "Semaphore timeout")
+            return
+        }
+
+        try {
+            // ждём rate-limit, как waitRateLimitOrTimeout у другой команды
+            if (!waitRateLimitOrTimeout(deadline)) {
+                recordProcessingFailure(paymentId, transactionId, "Rate limit wait exceeded deadline")
                 return
             }
 
-            val toBlock = deadline - System.currentTimeMillis()
-            if (!rateLimiter.tickBlocking(Duration.ofMillis(toBlock))) {
-                recordFinalFailure(paymentId, paymentStartedAt, "Rate limit exceeded")
-                return
-            }
+            var attempt = 0
 
-            val acquired = semaphore.tryAcquire(remainingTime, TimeUnit.MILLISECONDS)
-            if (!acquired) {
-                recordFinalFailure(paymentId, paymentStartedAt, "Semaphore timeout")
-                return
-            }
+            while (attempt < maxAttempts) {
+                attempt++
 
-            val transactionId = UUID.randomUUID()
-            paymentESService.update(paymentId) {
-                it.logSubmission(success = true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
-            }
-
-            try {
-
-                val callTimeout = minOf(remainingTime - 100, 2500)
-
-                metricsReporter.updateCurrentTimeout(accountName, callTimeout.toLong())
-
-                val request = Request.Builder().run {
-                    url("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount")
-                    post(emptyBody)
-                }.build()
-
-                client.newCall(request).execute().use { response ->
-                    val body = try {
-                        mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
-                    } catch (e: Exception) {
-                        logger.error("[$accountName] Parse error for payment $paymentId")
-                        ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, "Parse error")
-                    }
-
-                    if (response.code == 200 && body.result) {
-                        paymentESService.update(paymentId) {
-                            it.logProcessing(true, now(), transactionId, reason = body.message)
-                        }
-                        return
-                    }
-
-                    val shouldRetry = response.code == 429 || response.code in 500..599
-
-                    val cause = if (response.code == 429) RetryCause.HTTP_429 else RetryCause.HTTP_5XX
-                    metricsReporter.incrementRetry(accountName, cause)
-
-                    if (!shouldRetry || attempt == maxAttempts) {
-                        recordProcessingFailure(paymentId, transactionId, "HTTP ${response.code}: ${body.message}")
-                        return
-                    }
-
-                    val backoff = when (attempt) {
-                        1 -> 100L
-                        2 -> 200L
-                        else -> 400L
-                    }
-                    if (remainingTime > backoff + 200) {
-                        Thread.sleep(backoff)
-                    }
-                }
-            } catch (e: Exception) {
-                val shouldRetry = e is SocketTimeoutException && attempt < maxAttempts
-                if (!shouldRetry) {
-                    recordProcessingFailure(paymentId, transactionId,
-                        if (e is SocketTimeoutException) "Timeout" else e.message ?: "Error")
+                remainingTime = deadline - now()
+                if (remainingTime < 200) {
+                    recordProcessingFailure(paymentId, transactionId, "Insufficient time: ${remainingTime}ms")
                     return
                 }
 
-                metricsReporter.incrementRetry(accountName, RetryCause.TIMEOUT)
-                logger.info("[$accountName] Retry attempt ${attempt + 1} for payment $paymentId (cause=TIMEOUT)")
+                val callTimeout = minOf(remainingTime - 100, 2500)
+                metricsReporter.updateCurrentTimeout(accountName, callTimeout.toLong())
 
-                // Ретрай для таймаута без паузы
-            } finally {
-                semaphore.release()
+                val request = Request.Builder().run {
+                    url(
+                        "http://$paymentProviderHostPort/external/process" +
+                                "?serviceName=$serviceName&token=$token&accountName=$accountName" +
+                                "&transactionId=$transactionId&paymentId=$paymentId&amount=$amount"
+                    )
+                    post(emptyBody)
+                }.build()
+
+                try {
+                    client.newCall(request).execute().use { response ->
+                        val body = try {
+                            mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
+                        } catch (e: Exception) {
+                            logger.error("[$accountName] Parse error for payment $paymentId")
+                            ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, "Parse error")
+                        }
+
+                        if (response.code == 200 && body.result) {
+                            // как у них – фиксируем итог обработки в любом случае
+                            paymentESService.update(paymentId) {
+                                it.logProcessing(true, now(), transactionId, reason = body.message)
+                            }
+                            return
+                        }
+
+                        val shouldRetry = response.code == 429 || response.code in 500..599
+                        val cause = if (response.code == 429) RetryCause.HTTP_429 else RetryCause.HTTP_5XX
+                        metricsReporter.incrementRetry(accountName, cause)
+
+                        if (!shouldRetry || attempt == maxAttempts) {
+                            recordProcessingFailure(
+                                paymentId,
+                                transactionId,
+                                "HTTP ${response.code}: ${body.message}"
+                            )
+                            return
+                        }
+
+                        // простой backoff, как и был
+                        val backoff = when (attempt) {
+                            1 -> 100L
+                            2 -> 200L
+                            else -> 400L
+                        }
+
+                        remainingTime = deadline - now()
+                        if (remainingTime > backoff + 200) {
+                            Thread.sleep(backoff)
+                        }
+                    }
+                } catch (e: Exception) {
+                    val shouldRetry = e is SocketTimeoutException && attempt < maxAttempts
+                    if (!shouldRetry) {
+                        recordProcessingFailure(
+                            paymentId,
+                            transactionId,
+                            if (e is SocketTimeoutException) "Timeout" else e.message ?: "Error"
+                        )
+                        return
+                    }
+
+                    metricsReporter.incrementRetry(accountName, RetryCause.TIMEOUT)
+                    logger.info(
+                        "[$accountName] Retry attempt ${attempt + 1} for payment $paymentId (cause=TIMEOUT)"
+                    )
+                    // как в твоём коде – ретрай таймаута без доп. паузы (или можно добавить backoff, если нужно)
+                }
             }
+        } finally {
+            semaphore.release()
         }
     }
 
     private fun recordProcessingFailure(paymentId: UUID, transactionId: UUID, reason: String) {
         paymentESService.update(paymentId) {
-            it.logProcessing(false, now(), transactionId, reason = reason)
-        }
-    }
-
-    private fun recordFinalFailure(paymentId: UUID, paymentStartedAt: Long, reason: String) {
-        val transactionId = UUID.randomUUID()
-        paymentESService.update(paymentId) {
-            it.logSubmission(success = true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
             it.logProcessing(false, now(), transactionId, reason = reason)
         }
     }
