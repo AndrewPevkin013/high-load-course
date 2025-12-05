@@ -136,12 +136,12 @@ class PaymentExternalSystemAdapterImpl(
 
                         if (!shouldRetry || at == maxAttempts) {
                             recordProcessingFailure(paymentId, transactionId, "HTTP ${it.code}: ${body.message}")
-                            semaphore.release()
+//                            semaphore.release()
                             return
                         }
 
                         scheduleBackoff(at) { attempt(at + 1) }
-                        semaphore.release()
+//                        semaphore.release()
                     }
                 }
             })
