@@ -5,6 +5,7 @@ import com.fasterxml.jackson.module.kotlin.registerKotlinModule
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody
+import okio.use
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Autowired
 import ru.quipy.common.utils.SlidingWindowRateLimiter
@@ -28,7 +29,7 @@ class PaymentExternalSystemAdapterImpl(
 
 
     private val rps = properties.rateLimitPerSec;
-    private  val expectedProccesingTime = 20_000L;
+    private  val expectedProccesingTime = 10_000L;
     private val ioSlots: Int = ((rps * expectedProccesingTime) / 1000.0 * 1.2).toInt()
 
     private  val logger = LoggerFactory.getLogger(PaymentExternalSystemAdapter::class.java)
@@ -53,7 +54,7 @@ class PaymentExternalSystemAdapterImpl(
         .dispatcher(dispatcher)
         .build()
 
-    private val semaphore = Semaphore(parallelRequests)
+//    private val semaphore = Semaphore(parallelRequests)
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         val maxAttempts = 3
@@ -61,28 +62,28 @@ class PaymentExternalSystemAdapterImpl(
 
         fun attempt(at: Int) {
             val remainingTime = deadline - now()
-            if (remainingTime < 200) {
+            if (remainingTime < 2000) {
                 recordFinalFailure(paymentId, paymentStartedAt, "Insufficient time: ${remainingTime}ms")
                 return
             }
 
             val toBlock = deadline - System.currentTimeMillis()
-            if (!rateLimiter.tickBlocking(Duration.ofMillis(toBlock))) {
+            if (!rateLimiter.tick()) {
                 recordFinalFailure(paymentId, paymentStartedAt, "Rate limit exceeded")
                 return
             }
 
-            if (!semaphore.tryAcquire()) {
-                recordFinalFailure(paymentId, paymentStartedAt, "No I/O slots")
-                return
-            }
+//            if (!semaphore.tryAcquire()) {
+//                recordFinalFailure(paymentId, paymentStartedAt, "No I/O slots")
+//                return
+//            }
 
             paymentESService.update(paymentId) {
                 it.logSubmission(success = true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
             }
 
-            val callTimeout = (expectedProccesingTime + 2_000) // ~22s
-                .coerceAtMost(remainingTime - 100)
+            val callTimeout = (expectedProccesingTime + 2_000)
+                .coerceAtMost(remainingTime - 1000)
             metricsReporter.updateCurrentTimeout(accountName, callTimeout)
 
             val request = Request.Builder()
@@ -100,17 +101,16 @@ class PaymentExternalSystemAdapterImpl(
 
             call.enqueue(object : okhttp3.Callback {
                 override fun onFailure(call: okhttp3.Call, e: java.io.IOException) {
-                    val callMs = msSince(started)
+                    val shouldRetry = (e is SocketTimeoutException) && at < maxAttempts &&
+                            (deadline - now()) > 3000
 
-                    val shouldRetry = (e is SocketTimeoutException) && at < maxAttempts
                     if (!shouldRetry) {
-                        recordProcessingFailure(paymentId, transactionId, if (e is SocketTimeoutException) "Timeout" else e.message ?: "Error")
-                        semaphore.release()
+                        recordProcessingFailure(paymentId, transactionId,
+                            if (e is SocketTimeoutException) "Timeout" else e.message ?: "Error")
                         return
                     }
                     metricsReporter.incrementRetry(accountName, RetryCause.TIMEOUT)
                     scheduleBackoff(at) { attempt(at + 1) }
-                    semaphore.release()
                 }
 
                 override fun onResponse(call: okhttp3.Call, response: okhttp3.Response) {
@@ -127,7 +127,6 @@ class PaymentExternalSystemAdapterImpl(
                             paymentESService.update(paymentId) {
                                 it.logProcessing(true, now(), transactionId, reason = body.message)
                             }
-                            semaphore.release()
                             return
                         }
 
