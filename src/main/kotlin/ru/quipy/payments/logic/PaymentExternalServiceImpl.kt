@@ -67,7 +67,15 @@ class PaymentExternalSystemAdapterImpl(
             return
         }
 
+        val timeToBlock = deadline - System.currentTimeMillis()
+        val acquired = semaphore.tryAcquire(timeToBlock, TimeUnit.MILLISECONDS)
+        if (!acquired) {
+            recordFinalFailure(paymentId, paymentStartedAt, "No capacity")
+            return
+        }
+
         if (!rateLimiter.tick()) {
+            semaphore.release()
             recordFinalFailure(paymentId, paymentStartedAt, "Rate limit")
             return
         }
@@ -89,7 +97,7 @@ class PaymentExternalSystemAdapterImpl(
         val clientWithTimeouts = client.newCall(request)
         clientWithTimeouts.timeout().timeout(callTimeout, TimeUnit.MILLISECONDS)
 
-        clientWithTimeouts.newCall(request).enqueue(object : okhttp3.Callback {
+        clientWithTimeouts.enqueue(object : okhttp3.Callback {
             override fun onFailure(call: okhttp3.Call, e: java.io.IOException) {
                 semaphore.release()
                 val timeLeft = deadline - now()
