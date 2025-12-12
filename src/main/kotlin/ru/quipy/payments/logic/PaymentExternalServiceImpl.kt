@@ -29,7 +29,7 @@ class PaymentExternalSystemAdapterImpl(
 
     private val rps = properties.rateLimitPerSec;
     private  val expectedProccesingTime = 10_000L;
-    private val ioSlots: Int = ((rps * expectedProccesingTime) / 1000.0 * 1.5).toInt()
+    private val ioSlots: Int = ((rps * expectedProccesingTime) / 1000.0 * 1.2).toInt()
 
     private  val logger = LoggerFactory.getLogger(PaymentExternalSystemAdapter::class.java)
     private   val emptyBody = RequestBody.create(null, ByteArray(0))
@@ -51,104 +51,70 @@ class PaymentExternalSystemAdapterImpl(
 
     private val client = OkHttpClient.Builder()
         .protocols(listOf(Protocol.HTTP_2, Protocol.HTTP_1_1))
-        .connectionPool(ConnectionPool(100, 5, TimeUnit.MINUTES))
+        .connectionPool(ConnectionPool(200, 5, TimeUnit.MINUTES))
         .dispatcher(dispatcher)
         .build()
 
 //    private val semaphore = Semaphore(parallelRequests)
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
-        val maxAttempts = 3
         val transactionId = UUID.randomUUID()
+        val startTime = now()
 
-        fun attempt(at: Int) {
-            val remainingTime = deadline - now()
-            if (remainingTime < 2000) {
-                recordFinalFailure(paymentId, paymentStartedAt, "Insufficient time: ${remainingTime}ms")
-                return
-            }
-
-            val toBlock = deadline - System.currentTimeMillis()
-            if (!rateLimiter.tick()) {
-                recordFinalFailure(paymentId, paymentStartedAt, "Rate limit exceeded")
-                return
-            }
-
-//            if (!semaphore.tryAcquire()) {
-//                recordFinalFailure(paymentId, paymentStartedAt, "No I/O slots")
-//                return
-//            }
-
-            paymentESService.update(paymentId) {
-                it.logSubmission(success = true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
-            }
-
-            val callTimeout = (expectedProccesingTime + 2_000)
-                .coerceAtMost(remainingTime - 1000)
-            metricsReporter.updateCurrentTimeout(accountName, callTimeout)
-
-            val request = Request.Builder()
-                .url("http://$paymentProviderHostPort/external/process" +
-                        "?serviceName=$serviceName&token=$token&accountName=$accountName" +
-                        "&transactionId=$transactionId&paymentId=$paymentId&amount=$amount")
-                .post(emptyBody)
-                .build()
-
-            val call = client.newCall(request)
-            call.timeout().timeout(callTimeout, TimeUnit.MILLISECONDS)
-
-
-            val started = System.nanoTime()
-
-            call.enqueue(object : okhttp3.Callback {
-                override fun onFailure(call: okhttp3.Call, e: java.io.IOException) {
-                    val shouldRetry = (e is SocketTimeoutException) && at < maxAttempts &&
-                            (deadline - now()) > 3000
-
-                    if (!shouldRetry) {
-                        recordProcessingFailure(paymentId, transactionId,
-                            if (e is SocketTimeoutException) "Timeout" else e.message ?: "Error")
-                        return
-                    }
-                    metricsReporter.incrementRetry(accountName, RetryCause.TIMEOUT)
-                    scheduleBackoff(at) { attempt(at + 1) }
-                }
-
-                override fun onResponse(call: okhttp3.Call, response: okhttp3.Response) {
-                    response.use {
-                        val body = runCatching {
-                            mapper.readValue(it.body?.string(), ExternalSysResponse::class.java)
-                        }.getOrElse {
-                            logger.error("[$accountName] Parse error for payment $paymentId")
-                            ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, "Parse error")
-                        }
-
-
-                        if (it.code == 200 && body.result) {
-                            paymentESService.update(paymentId) {
-                                it.logProcessing(true, now(), transactionId, reason = body.message)
-                            }
-                            return
-                        }
-
-                        val shouldRetry = it.code == 429 || it.code in 500..599
-                        val cause = if (it.code == 429) RetryCause.HTTP_429 else RetryCause.HTTP_5XX
-                        metricsReporter.incrementRetry(accountName, cause)
-
-                        if (!shouldRetry || at == maxAttempts) {
-                            recordProcessingFailure(paymentId, transactionId, "HTTP ${it.code}: ${body.message}")
-//                            semaphore.release()
-                            return
-                        }
-
-                        scheduleBackoff(at) { attempt(at + 1) }
-//                        semaphore.release()
-                    }
-                }
-            })
+        val initialRemainingTime = deadline - startTime
+        if (initialRemainingTime < 5000) {
+            recordFinalFailure(paymentId, paymentStartedAt, "No time")
+            return
         }
 
-        attempt(1)
+        if (!rateLimiter.tick()) {
+            recordFinalFailure(paymentId, paymentStartedAt, "Rate limit")
+            return
+        }
+
+        paymentESService.update(paymentId) {
+            it.logSubmission(true, transactionId, startTime, Duration.ofMillis(startTime - paymentStartedAt))
+        }
+
+        val callTimeout = minOf(initialRemainingTime - 2000, 15000L)
+
+        val clientWithTimeouts = client.newBuilder()
+            .callTimeout(callTimeout, TimeUnit.MILLISECONDS)
+            .build()
+
+        val request = Request.Builder()
+            .url("http://$paymentProviderHostPort/external/process" +
+                    "?serviceName=$serviceName&token=$token&accountName=$accountName" +
+                    "&transactionId=$transactionId&paymentId=$paymentId&amount=$amount")
+            .post(RequestBody.create(null, ByteArray(0)))
+            .build()
+
+        clientWithTimeouts.newCall(request).enqueue(object : okhttp3.Callback {
+            override fun onFailure(call: okhttp3.Call, e: java.io.IOException) {
+                val timeSpent = now() - startTime
+                val timeLeft = deadline - now()
+
+                if (e is SocketTimeoutException && timeLeft > 5000) {
+                    performPaymentAsync(paymentId, amount, paymentStartedAt, deadline)
+                } else {
+                    recordProcessingFailure(paymentId, transactionId, "Failed: ${e.message}")
+                }
+            }
+
+            override fun onResponse(call: okhttp3.Call, response: okhttp3.Response) {
+                response.use {
+                    val body = try {
+                        mapper.readValue(it.body?.string(), ExternalSysResponse::class.java)
+                    } catch (e: Exception) {
+                        ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, "Parse error")
+                    }
+
+                    paymentESService.update(paymentId) {
+                        it.logProcessing(body.result, now(), transactionId, reason = body.message)
+                    }
+                }
+            }
+        })
     }
 
     object Schedulers {
