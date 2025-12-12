@@ -29,7 +29,7 @@ class PaymentExternalSystemAdapterImpl(
 
     private val rps = properties.rateLimitPerSec;
     private  val expectedProccesingTime = 10_000L;
-    private val ioSlots: Int = ((rps * expectedProccesingTime) / 1000.0 * 1.2).toInt()
+    private val ioSlots: Int = ((rps * expectedProccesingTime) / 1000.0 * 2).toInt()
 
     private  val logger = LoggerFactory.getLogger(PaymentExternalSystemAdapter::class.java)
     private   val emptyBody = RequestBody.create(null, ByteArray(0))
@@ -55,7 +55,7 @@ class PaymentExternalSystemAdapterImpl(
         .dispatcher(dispatcher)
         .build()
 
-    private val semaphore = Semaphore(parallelRequests)
+//    private val semaphore = Semaphore(parallelRequests)
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         val transactionId = UUID.randomUUID()
@@ -67,15 +67,15 @@ class PaymentExternalSystemAdapterImpl(
             return
         }
 
-        val timeToBlock = deadline - System.currentTimeMillis()
-        val acquired = semaphore.tryAcquire(timeToBlock, TimeUnit.MILLISECONDS)
-        if (!acquired) {
-            recordFinalFailure(paymentId, paymentStartedAt, "No capacity")
-            return
-        }
+//        val timeToBlock = deadline - System.currentTimeMillis()
+//        val acquired = semaphore.tryAcquire(timeToBlock, TimeUnit.MILLISECONDS)
+//        if (!acquired) {
+//            recordFinalFailure(paymentId, paymentStartedAt, "No capacity")
+//            return
+//        }
 
         if (!rateLimiter.tick()) {
-            semaphore.release()
+//            semaphore.release()
             recordFinalFailure(paymentId, paymentStartedAt, "Rate limit")
             return
         }
@@ -99,7 +99,7 @@ class PaymentExternalSystemAdapterImpl(
 
         clientWithTimeouts.enqueue(object : okhttp3.Callback {
             override fun onFailure(call: okhttp3.Call, e: java.io.IOException) {
-                semaphore.release()
+//                semaphore.release()
                 val timeLeft = deadline - now()
 
                 if (e is SocketTimeoutException && timeLeft > 5000) {
@@ -110,7 +110,7 @@ class PaymentExternalSystemAdapterImpl(
             }
 
             override fun onResponse(call: okhttp3.Call, response: okhttp3.Response) {
-                semaphore.release()
+//                semaphore.release()
                 response.use {
                     val body = try {
                         mapper.readValue(it.body?.string(), ExternalSysResponse::class.java)
