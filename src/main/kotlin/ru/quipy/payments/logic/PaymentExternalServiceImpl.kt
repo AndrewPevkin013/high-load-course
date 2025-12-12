@@ -57,7 +57,7 @@ class PaymentExternalSystemAdapterImpl(
 //    private val semaphore = Semaphore(parallelRequests)
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
-        val maxAttempts = 3
+        val maxAttempts = 10
         val transactionId = UUID.randomUUID()
 
         fun attempt(at: Int) {
