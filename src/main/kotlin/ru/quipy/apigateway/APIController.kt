@@ -56,8 +56,10 @@ class APIController {
     }
 
     @PostMapping("/orders/{orderId}/payment")
-    fun payOrder(@PathVariable orderId: UUID, @RequestParam deadline: Long): ResponseEntity<PaymentSubmissionDto> {
+    suspend fun payOrder(@PathVariable orderId: UUID, @RequestParam deadline: Long): ResponseEntity<PaymentSubmissionDto> {
+
         val paymentId = UUID.randomUUID()
+
         val order = orderRepository.findById(orderId)?.let {
             orderRepository.save(it.copy(status = OrderStatus.PAYMENT_IN_PROGRESS))
             it
@@ -65,6 +67,7 @@ class APIController {
 
         try {
             val createdAt = orderPayer.processPayment(orderId, order.price, paymentId, deadline)
+
             return ResponseEntity.ok(PaymentSubmissionDto(createdAt, paymentId))
         } catch (e: TooManyRequestsError) {
             return ResponseEntity.status(429).header("Retry-After", e.retryAfterMillis.toString()).build()
