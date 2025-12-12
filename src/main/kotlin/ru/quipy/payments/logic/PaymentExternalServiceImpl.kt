@@ -2,11 +2,10 @@ package ru.quipy.payments.logic
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
-import okhttp3.OkHttpClient
-import okhttp3.Request
-import okhttp3.RequestBody
+import okhttp3.*
 import okio.use
 import org.slf4j.LoggerFactory
+import org.springframework.aot.hint.TypeReference.listOf
 import org.springframework.beans.factory.annotation.Autowired
 import ru.quipy.common.utils.SlidingWindowRateLimiter
 import ru.quipy.core.EventSourcingService
@@ -30,7 +29,7 @@ class PaymentExternalSystemAdapterImpl(
 
     private val rps = properties.rateLimitPerSec;
     private  val expectedProccesingTime = 10_000L;
-    private val ioSlots: Int = ((rps * expectedProccesingTime) / 1000.0 * 2).toInt()
+    private val ioSlots: Int = ((rps * expectedProccesingTime) / 1000.0 * 1.5).toInt()
 
     private  val logger = LoggerFactory.getLogger(PaymentExternalSystemAdapter::class.java)
     private   val emptyBody = RequestBody.create(null, ByteArray(0))
@@ -51,6 +50,8 @@ class PaymentExternalSystemAdapterImpl(
     }
 
     private val client = OkHttpClient.Builder()
+        .protocols(listOf(Protocol.HTTP_2, Protocol.HTTP_1_1))
+        .connectionPool(ConnectionPool(100, 5, TimeUnit.MINUTES))
         .dispatcher(dispatcher)
         .build()
 

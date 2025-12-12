@@ -30,6 +30,8 @@ class OrderPayer {
     @Autowired
     private lateinit var paymentESService: EventSourcingService<UUID, PaymentAggregate, PaymentAggregateState>
 
+    private val boundedQueue = LinkedBlockingQueue<Runnable>(10_000)
+
     @Autowired
     private lateinit var paymentService: PaymentService
 
@@ -38,7 +40,7 @@ class OrderPayer {
         1200,
         60L,
         TimeUnit.SECONDS,
-        LinkedBlockingQueue(10_000),
+        boundedQueue,
         NamedThreadFactory("payment-submission-executor"),
         CallerBlockingRejectedExecutionHandler()
     )
