@@ -30,7 +30,7 @@ class PaymentExternalSystemAdapterImpl(
 
     private val rps = properties.rateLimitPerSec;
     private  val expectedProccesingTime = 10_000L;
-    private val ioSlots: Int = ((rps * expectedProccesingTime) / 1000.0 * 1.2).toInt()
+    private val ioSlots: Int = ((rps * expectedProccesingTime) / 1000.0 * 2).toInt()
 
     private  val logger = LoggerFactory.getLogger(PaymentExternalSystemAdapter::class.java)
     private   val emptyBody = RequestBody.create(null, ByteArray(0))
@@ -57,7 +57,7 @@ class PaymentExternalSystemAdapterImpl(
 //    private val semaphore = Semaphore(parallelRequests)
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
-        val maxAttempts = 10
+        val maxAttempts = 3
         val transactionId = UUID.randomUUID()
 
         fun attempt(at: Int) {
@@ -160,7 +160,7 @@ class PaymentExternalSystemAdapterImpl(
 
 
     private fun scheduleBackoff(attempt: Int, action: () -> Unit) {
-        val backoff = when (attempt) { 1 -> 100L; 2 -> 200L; else -> 400L }
+        val backoff = when (attempt) { 1 -> 50L; 2 -> 100L; else -> 200L }
         Schedulers.backoff.schedule(action, backoff, TimeUnit.MILLISECONDS)
     }
 
