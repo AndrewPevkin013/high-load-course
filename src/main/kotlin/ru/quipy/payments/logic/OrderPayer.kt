@@ -6,14 +6,10 @@ import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.stereotype.Service
 import ru.quipy.apigateway.TooManyRequestsError
 import ru.quipy.common.utils.CallerBlockingRejectedExecutionHandler
-import ru.quipy.common.utils.CompositeRateLimiter
-import ru.quipy.common.utils.LeakingBucketRateLimiter
 import ru.quipy.common.utils.NamedThreadFactory
 import ru.quipy.common.utils.SlidingWindowRateLimiter
-import ru.quipy.common.utils.TokenBucketRateLimiter
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
-import ru.quipy.payments.config.PaymentAccountsConfig
 import java.time.Duration
 import java.util.*
 import java.util.concurrent.LinkedBlockingQueue
@@ -34,8 +30,8 @@ class OrderPayer {
     private lateinit var paymentService: PaymentService
 
     private val paymentExecutor = ThreadPoolExecutor(
-        16,
-        16,
+        50,
+        50, // пропускная способность одного потока 1/averageProccesingTime = 1/0,5 = 2 , rps = 100 , 100/2 = 50
         0L,
         TimeUnit.MILLISECONDS,
         LinkedBlockingQueue(8000),
@@ -43,15 +39,21 @@ class OrderPayer {
         CallerBlockingRejectedExecutionHandler()
     )
 
-    private val rateLimiter = SlidingWindowRateLimiter(8, Duration.ofSeconds(1))
+    private val rateLimitPerSec = 120L // это рейт лимитер для внешней системы - в конфиге у нее 120 рпс - это кол-во запросов,которая ОНА в состоянии принять
+                                            // очевидно,что даже с учетом того,что наш рпс 100 лучше не просаживать 20 запросов в пустую
+    private val processingTimeSec = 1L
+
+    private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec, Duration.ofSeconds(processingTimeSec))
 
     fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long {
+
         val toBlock = deadline - System.currentTimeMillis()
+
         if (toBlock <= 0) {
             throw TooManyRequestsError(1000)
         }
 
-        if (!rateLimiter.tickBlocking(Duration.ofMillis(toBlock))) {
+        if (!rateLimiter.tick()) {
             throw TooManyRequestsError(1000)
         }
 

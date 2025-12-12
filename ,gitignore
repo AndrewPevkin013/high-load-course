@@ -1,0 +1,114 @@
+# -----------------------------
+# Java / Spring Boot
+# -----------------------------
+/target/
+/out/
+/build/
+/bin/
+/classes/
+
+*.log
+*.tmp
+*.pid
+*.swp
+*.swo
+
+# Spring Boot devtools restart directory
+.spring-boot-devtools
+
+# -----------------------------
+# Maven
+# -----------------------------
+/.mvn/wrapper/maven-wrapper.jar
+.mvn/wrapper/maven-wrapper.properties
+/logs/
+!src/main/resources/logback-spring.xml
+
+# Maven local build props
+.mvn/timing.properties
+
+# -----------------------------
+# Gradle
+# -----------------------------
+/.gradle/
+/build/
+!gradle/wrapper/gradle-wrapper.jar
+
+# Avoid ignoring Gradle wrapper jar file
+gradle-app.setting
+
+# -----------------------------
+# IntelliJ IDEA / Rider
+# -----------------------------
+/.idea/
+/*.iml
+*.iws
+*.ipr
+
+# Rider logs
+/.idea/.idea.ReSharperPlatform*/  
+/.idea/system/
+
+# -----------------------------
+# VS Code
+# -----------------------------
+.vscode/
+
+# -----------------------------
+# OS-specific
+# -----------------------------
+.DS_Store
+Thumbs.db
+
+# -----------------------------
+# Environment & Secrets
+# -----------------------------
+*.env
+*.env.local
+*.env.*.local
+
+# Avoid committing credentials to Grafana / Prometheus
+grafana/provisioning/datasources/*.yaml
+grafana/provisioning/notifiers/*.yaml
+
+# Prometheus auth / runtime data
+prometheus/*.db
+prometheus/data/
+
+# -----------------------------
+# Docker / Compose
+# -----------------------------
+/docker-data/
+/docker/logs/
+/docker/grafana/data/
+/docker/prometheus/data/
+
+# Docker files generated automatically
+**/.dockerignore
+**/docker-compose.override.yml
+
+# Local volumes
+volumes/
+data/
+
+# -----------------------------
+# Logs
+# -----------------------------
+logs/
+*.log
+*.out
+
+# -----------------------------
+# Metrics / temp files
+# -----------------------------
+*.json.tmp
+*.cache
+*.lck
+
+# Grafana session & plugins
+grafana/data/
+grafana/plugins/
+
+# Prometheus TSDB
+prometheus/data/
+prometheus/tsdb/
