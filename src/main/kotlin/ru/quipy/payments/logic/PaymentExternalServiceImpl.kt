@@ -55,7 +55,7 @@ class PaymentExternalSystemAdapterImpl(
         .dispatcher(dispatcher)
         .build()
 
-//    private val semaphore = Semaphore(parallelRequests)
+    private val semaphore = Semaphore(parallelRequests)
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         val transactionId = UUID.randomUUID()
@@ -78,9 +78,6 @@ class PaymentExternalSystemAdapterImpl(
 
         val callTimeout = minOf(initialRemainingTime - 2000, 15000L)
 
-        val clientWithTimeouts = client.newBuilder()
-            .callTimeout(callTimeout, TimeUnit.MILLISECONDS)
-            .build()
 
         val request = Request.Builder()
             .url("http://$paymentProviderHostPort/external/process" +
@@ -89,9 +86,12 @@ class PaymentExternalSystemAdapterImpl(
             .post(RequestBody.create(null, ByteArray(0)))
             .build()
 
+        val clientWithTimeouts = client.newCall(request)
+        clientWithTimeouts.timeout().timeout(callTimeout, TimeUnit.MILLISECONDS)
+
         clientWithTimeouts.newCall(request).enqueue(object : okhttp3.Callback {
             override fun onFailure(call: okhttp3.Call, e: java.io.IOException) {
-                val timeSpent = now() - startTime
+                semaphore.release()
                 val timeLeft = deadline - now()
 
                 if (e is SocketTimeoutException && timeLeft > 5000) {
@@ -102,6 +102,7 @@ class PaymentExternalSystemAdapterImpl(
             }
 
             override fun onResponse(call: okhttp3.Call, response: okhttp3.Response) {
+                semaphore.release()
                 response.use {
                     val body = try {
                         mapper.readValue(it.body?.string(), ExternalSysResponse::class.java)
@@ -130,8 +131,6 @@ class PaymentExternalSystemAdapterImpl(
         val backoff = when (attempt) { 1 -> 50L; 2 -> 100L; else -> 200L }
         Schedulers.backoff.schedule(action, backoff, TimeUnit.MILLISECONDS)
     }
-
-    private fun msSince(ns: Long) = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - ns)
 
 
     private fun recordProcessingFailure(paymentId: UUID, transactionId: UUID, reason: String) {

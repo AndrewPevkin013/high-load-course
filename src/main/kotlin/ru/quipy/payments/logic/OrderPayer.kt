@@ -48,16 +48,13 @@ class OrderPayer {
     private val rateLimiter = SlidingWindowRateLimiter(1100, Duration.ofSeconds(1))
 
     fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long {
-        val toBlock = deadline - System.currentTimeMillis()
-        if (toBlock <= 0) {
-            throw TooManyRequestsError(1000)
-        }
-
-        if (!rateLimiter.tick()) {
-            throw TooManyRequestsError(1000)
-        }
-
         val createdAt = System.currentTimeMillis()
+        val toBlock = deadline - createdAt
+
+        if (!rateLimiter.tickBlocking(Duration.ofMillis(toBlock))) {
+            throw TooManyRequestsError(1000)
+        }
+
         paymentExecutor.submit {
             val createdEvent = paymentESService.create {
                 it.create(paymentId, orderId, amount)
