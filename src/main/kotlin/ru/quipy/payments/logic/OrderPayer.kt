@@ -33,8 +33,8 @@ class OrderPayer {
     @Autowired
     private lateinit var paymentService: PaymentService
     private val paymentExecutor = ThreadPoolExecutor(
-        200,
-        10000, // пропускная способность одного потока 1/averageProccesingTime = 1/0,5 = 2 , rps = 100 , 100/2 = 50
+        16,
+        16, // пропускная способность одного потока 1/averageProccesingTime = 1/0,5 = 2 , rps = 100 , 100/2 = 50
         0L,
         TimeUnit.MILLISECONDS,
         LinkedBlockingQueue(50_000),
@@ -56,9 +56,9 @@ class OrderPayer {
 
         val toBlock = deadline - System.currentTimeMillis()
 
-        if (toBlock <= 0) {
-            throw TooManyRequestsError(10_000)
-        }
+//        if (toBlock <= 0) {
+//            throw TooManyRequestsError(10_000)
+//        }
 
         if (!rateLimiter.tick()) {
             throw TooManyRequestsError(10_000)
