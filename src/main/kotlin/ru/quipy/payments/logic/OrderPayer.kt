@@ -50,15 +50,15 @@ class OrderPayer {
     val executorScope = CoroutineScope(paymentExecutor.asCoroutineDispatcher())
     fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long {
 
-        val toBlock = deadline - System.currentTimeMillis()
-
-        if (toBlock <= 0) {
-            throw TooManyRequestsError(1000)
-        }
-
-        if (!rateLimiter.tick()) {
-            throw TooManyRequestsError(1000)
-        }
+//        val toBlock = deadline - System.currentTimeMillis()
+//
+//        if (toBlock <= 0) {
+//            throw TooManyRequestsError(1000)
+//        }
+//
+//        if (!rateLimiter.tick()) {
+//            throw TooManyRequestsError(1000)
+//        }
 
         val createdAt = System.currentTimeMillis()
         executorScope.launch {
