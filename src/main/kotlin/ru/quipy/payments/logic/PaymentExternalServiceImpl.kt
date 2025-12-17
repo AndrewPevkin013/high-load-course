@@ -38,7 +38,7 @@ class PaymentExternalSystemAdapterImpl(
     private val requestAverageProcessingTime = properties.averageProcessingTime
     private val rateLimitPerSec = properties.rateLimitPerSec
 
-    private val semaphore = Semaphore(parallelRequests.coerceAtMost(1000))
+    private val semaphore = Semaphore(parallelRequests)
 
     private val client = HttpClient
         .newBuilder()
@@ -47,11 +47,13 @@ class PaymentExternalSystemAdapterImpl(
         .connectTimeout(Duration.ofMillis(500))
         .build()
 
-    private val rateLimiter = SlidingWindowRateLimiter(properties.rateLimitPerSec.toLong(), Duration.ofSeconds(1))
+    private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), Duration.ofSeconds(1))
 
     private val maxRetryCount = 3
     private val maxDelay = 1000L
     private val startDelay = 200L
+
+    private val pendingQueue = java.util.concurrent.ConcurrentLinkedQueue<() -> Unit>()
 
     private fun exponentialBackoffDelay(attempt: Int): Long {
         return minOf((startDelay * 2.0.pow((attempt - 1).toDouble())).toLong(), maxDelay)
@@ -106,11 +108,13 @@ class PaymentExternalSystemAdapterImpl(
         attempt: Int
     ) {
         if (now() > deadline || attempt > maxRetryCount) {
-            logger.error("[$accountName] Deadline exceeded or max retries reached for payment $paymentId")
-            paymentESService.update(paymentId) {
-                it.logProcessing(false, now(), transactionId, reason = "Deadline exceeded or max retries reached")
+            if (now() >= deadline) {
+                logger.error("[$accountName] Deadline exceeded or max retries reached for payment $paymentId")
+                paymentESService.update(paymentId) {
+                    it.logProcessing(false, now(), transactionId, reason = "Deadline exceeded or max retries reached")
+                }
+                return
             }
-            return
         }
 
         val timeToBlock = deadline - now()
@@ -154,18 +158,8 @@ class PaymentExternalSystemAdapterImpl(
                         it.logProcessing(body.result, now(), transactionId, reason = body.message)
                     }
 
-                    if (!body.result && attempt < maxRetryCount) {
-                        val delay = exponentialBackoffDelay(attempt)
-                        val remaining = deadline - now()
-                        if (remaining > delay + 100) {
-                            Thread.sleep(delay)
-                            semaphore.release()
-                            performRequestWithRetry(paymentId, amount, transactionId, paymentStartedAt, deadline, attempt + 1)
-                        } else {
-                            semaphore.release()
-                        }
-                    } else {
-                        semaphore.release()
+                    if (!body.result && attempt < maxRetryCount && now() < deadline - 100) {
+                        logger.warn("[$accountName] Payment failed, scheduling retry for $paymentId")
                     }
 
                 } catch (e: Exception) {
@@ -190,16 +184,16 @@ class PaymentExternalSystemAdapterImpl(
                     }
                 }
 
-                if (attempt < maxRetryCount) {
-                    val delay = exponentialBackoffDelay(attempt)
-                    val remaining = deadline - now()
-                    if (remaining > delay + 100) {
-                        Thread.sleep(delay)
-                        performRequestWithRetry(paymentId, amount, transactionId, paymentStartedAt, deadline, attempt + 1)
-                    }
-                }
+//                if (attempt < maxRetryCount) {
+//                    val delay = exponentialBackoffDelay(attempt)
+//                    val remaining = deadline - now()
+//                    if (remaining > delay + 100) {
+//                        Thread.sleep(delay)
+//                        performRequestWithRetry(paymentId, amount, transactionId, paymentStartedAt, deadline, attempt + 1)
+//                    }
+//                }
                 null
-            }
+            }.thenRun { semaphore.release() }
 
         } catch (e: Exception) {
             semaphore.release()
