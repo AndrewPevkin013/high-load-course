@@ -1,5 +1,8 @@
 package ru.quipy.payments.logic
 
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.asCoroutineDispatcher
+import kotlinx.coroutines.launch
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Autowired
@@ -44,7 +47,7 @@ class OrderPayer {
     private val processingTimeSec = 50L
 
     private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec, Duration.ofSeconds(processingTimeSec))
-
+    val executorScope = CoroutineScope(paymentExecutor.asCoroutineDispatcher())
     fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long {
 
         val toBlock = deadline - System.currentTimeMillis()
@@ -58,7 +61,7 @@ class OrderPayer {
         }
 
         val createdAt = System.currentTimeMillis()
-        paymentExecutor.submit {
+        executorScope.launch {
             val createdEvent = paymentESService.create {
                 it.create(paymentId, orderId, amount)
             }

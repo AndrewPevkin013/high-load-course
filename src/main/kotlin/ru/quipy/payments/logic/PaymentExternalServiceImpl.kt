@@ -101,7 +101,7 @@ class PaymentExternalSystemAdapterImpl(
         }
     }
 
-    override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
+    override suspend fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
 
         logger.warn("[$accountName] Submitting payment request for payment $paymentId");
 
@@ -136,7 +136,7 @@ class PaymentExternalSystemAdapterImpl(
             .build();
             val toBlock = deadline - System.currentTimeMillis()
 
-            while (toBlock >=0 && amountOfRetries < maxRetryCount) {
+            while (deadline - System.currentTimeMillis() >=0 && amountOfRetries < maxRetryCount) {
 
                     ++amountOfRetries;
                     client.sendAsync(request, HttpResponse.BodyHandlers.ofString()).thenApply { response ->
@@ -159,7 +159,7 @@ class PaymentExternalSystemAdapterImpl(
                         }
 
                         if (body.result || (amountOfRetries == maxRetryCount)) {
-                            break;
+                            amountOfRetries = maxRetryCount;
                         }
 
                         Thread.sleep(calculateBackOff(amountOfRetries));
