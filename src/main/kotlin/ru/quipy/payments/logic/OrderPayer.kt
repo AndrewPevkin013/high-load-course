@@ -34,54 +34,36 @@ class OrderPayer {
     private lateinit var paymentService: PaymentService
 
     private val paymentExecutor = ThreadPoolExecutor(
-        10000,
-        10000, // пропускная способность одного потока 1/averageProccesingTime = 1/0,5 = 2 , rps = 100 , 100/2 = 50
-        0L,
-        TimeUnit.MILLISECONDS,
-        LinkedBlockingQueue<Runnable>(8_000),
+        200,
+        400,
+        60L,
+        TimeUnit.SECONDS,
+        LinkedBlockingQueue<Runnable>(50_000),
         NamedThreadFactory("payment-submission-executor"),
         CallerBlockingRejectedExecutionHandler()
     )
 
-    private val rateLimitPerSec = 1100L // это рейт лимитер для внешней системы - в конфиге у нее 120 рпс - это кол-во запросов,которая ОНА в состоянии принять
-                                            // очевидно,что даже с учетом того,что наш рпс 100 лучше не просаживать 20 запросов в пустую
-    private val processingTimeSec = 50L
+    private val rateLimiter = SlidingWindowRateLimiter(1100L, Duration.ofSeconds(1))
 
-    private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec, Duration.ofSeconds(1))
-    suspend fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long {
-
-//        val toBlock = deadline - System.currentTimeMillis()
-//        if (!rateLimiter.tickBlocking(Duration.ofMillis(toBlock))) {
-//            throw RuntimeException("Rate limit exceeded")
-//        }
-//
-//        if (toBlock <= 0) {
-//            throw TooManyRequestsError(1000)
-//        }
-//
-//        if (!rateLimiter.tick()) {
-//            throw TooManyRequestsError(1000)
-//        }
-
+    fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long {
         val createdAt = System.currentTimeMillis()
-//        paymentExecutor.submit {
-//            val createdEvent = paymentESService.create {
-//                it.create(paymentId, orderId, amount)
-//            }
-//            logger.trace("Payment ${createdEvent.paymentId} for order $orderId created.")
-//            paymentService.submitPaymentRequest(paymentId, amount, createdAt, deadline)
-//        }
-        GlobalScope.launch(Dispatchers.IO) {
+
+        if (!rateLimiter.tick()) {
+            throw RuntimeException("Rate limit exceeded")
+        }
+
+        paymentExecutor.submit {
             try {
-                paymentESService.create {
+                val createdEvent = paymentESService.create {
                     it.create(paymentId, orderId, amount)
                 }
-                logger.trace("Payment $paymentId for order $orderId created.")
+                logger.trace("Payment ${createdEvent.paymentId} for order $orderId created.")
+
+                paymentService.submitPaymentRequest(paymentId, amount, createdAt, deadline)
             } catch (e: Exception) {
-                logger.error("Error creating payment $paymentId for order $orderId", e)
+                logger.error("Error processing payment $paymentId for order $orderId", e)
             }
         }
-        paymentService.submitPaymentRequest(paymentId, amount, createdAt, deadline)
         return createdAt
     }
 }
