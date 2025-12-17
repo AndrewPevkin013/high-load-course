@@ -101,7 +101,7 @@ class PaymentExternalSystemAdapterImpl(
         }
     }
 
-    override suspend fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
+    override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
 
         logger.warn("[$accountName] Submitting payment request for payment $paymentId");
 

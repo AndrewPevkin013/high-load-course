@@ -35,9 +35,9 @@ class OrderPayer {
     private val paymentExecutor = ThreadPoolExecutor(
         10000,
         10000, // пропускная способность одного потока 1/averageProccesingTime = 1/0,5 = 2 , rps = 100 , 100/2 = 50
-        0L,
-        TimeUnit.MILLISECONDS,
-        LinkedBlockingQueue(8000),
+        60L,
+        TimeUnit.SECONDS,
+        LinkedBlockingQueue<Runnable>(8_000),
         NamedThreadFactory("payment-submission-executor"),
         CallerBlockingRejectedExecutionHandler()
     )
@@ -49,7 +49,10 @@ class OrderPayer {
     private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec, Duration.ofSeconds(processingTimeSec))
     fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long {
 
-//        val toBlock = deadline - System.currentTimeMillis()
+        val toBlock = deadline - System.currentTimeMillis()
+        if (!rateLimiter.tickBlocking(Duration.ofMillis(toBlock))) {
+            throw RuntimeException("Rate limit exceeded")
+        }
 //
 //        if (toBlock <= 0) {
 //            throw TooManyRequestsError(1000)
