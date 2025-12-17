@@ -47,7 +47,6 @@ class OrderPayer {
     private val processingTimeSec = 50L
 
     private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec, Duration.ofSeconds(processingTimeSec))
-    val executorScope = CoroutineScope(paymentExecutor.asCoroutineDispatcher())
     fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long {
 
 //        val toBlock = deadline - System.currentTimeMillis()
@@ -61,7 +60,7 @@ class OrderPayer {
 //        }
 
         val createdAt = System.currentTimeMillis()
-        executorScope.launch {
+        paymentExecutor.submit {
             val createdEvent = paymentESService.create {
                 it.create(paymentId, orderId, amount)
             }
