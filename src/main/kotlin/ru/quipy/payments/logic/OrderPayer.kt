@@ -15,6 +15,9 @@ import java.util.*
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.asCoroutineDispatcher
+import kotlinx.coroutines.async
 
 @Service
 class OrderPayer {
@@ -28,24 +31,24 @@ class OrderPayer {
 
     @Autowired
     private lateinit var paymentService: PaymentService
-
+    private lateinit var executorScope: CoroutineScope
     private val paymentExecutor = ThreadPoolExecutor(
-        50,
-        50, // пропускная способность одного потока 1/averageProccesingTime = 1/0,5 = 2 , rps = 100 , 100/2 = 50
+        16,
+        16, // пропускная способность одного потока 1/averageProccesingTime = 1/0,5 = 2 , rps = 100 , 100/2 = 50
         0L,
         TimeUnit.MILLISECONDS,
-        LinkedBlockingQueue(8000),
+        LinkedBlockingQueue(10_000),
         NamedThreadFactory("payment-submission-executor"),
         CallerBlockingRejectedExecutionHandler()
     )
-
-    private val rateLimitPerSec = 120L // это рейт лимитер для внешней системы - в конфиге у нее 120 рпс - это кол-во запросов,которая ОНА в состоянии принять
+    private val rateLimitPerSec = 1100L // это рейт лимитер для внешней системы - в конфиге у нее 120 рпс - это кол-во запросов,которая ОНА в состоянии принять
                                             // очевидно,что даже с учетом того,что наш рпс 100 лучше не просаживать 20 запросов в пустую
     private val processingTimeSec = 1L
 
     private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec, Duration.ofSeconds(processingTimeSec))
 
-    fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long {
+    suspend fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long {
+        executorScope = CoroutineScope(paymentExecutor.asCoroutineDispatcher())
 
         val toBlock = deadline - System.currentTimeMillis()
 
@@ -58,7 +61,7 @@ class OrderPayer {
         }
 
         val createdAt = System.currentTimeMillis()
-        paymentExecutor.submit {
+        executorScope.async {
             val createdEvent = paymentESService.create {
                 it.create(paymentId, orderId, amount)
             }
