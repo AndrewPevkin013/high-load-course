@@ -158,9 +158,9 @@ class PaymentExternalSystemAdapterImpl(
                             it.logProcessing(body.result, now(), transactionId, reason = body.message);
                         }
 
-//                        if (body.result || (amountOfRetries == maxRetryCount)) {
-//                            break;
-//                        }
+                        if (body.result || (amountOfRetries == maxRetryCount)) {
+                            break;
+                        }
 
                         Thread.sleep(calculateBackOff(amountOfRetries));
 
