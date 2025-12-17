@@ -3,12 +3,9 @@ package ru.quipy.payments.logic
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
 import java.net.http.HttpClient
-import okhttp3.Request
-import okhttp3.RequestBody
 import java.net.http.HttpResponse
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Autowired
-import ru.quipy.common.utils.OngoingWindow
 import ru.quipy.common.utils.SlidingWindowRateLimiter
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
@@ -18,6 +15,7 @@ import java.net.http.HttpRequest
 import java.time.Duration
 import java.util.*
 import java.util.concurrent.Executors
+import java.util.concurrent.Semaphore
 import java.util.concurrent.TimeUnit
 
 class PaymentExternalSystemAdapterImpl(
@@ -25,12 +23,10 @@ class PaymentExternalSystemAdapterImpl(
     private val paymentESService: EventSourcingService<UUID, PaymentAggregate, PaymentAggregateState>,
     private val paymentProviderHostPort: String,
     private val token: String,
-    @Autowired private val metricsReporter: MetricsReporter
 ) : PaymentExternalSystemAdapter {
 
     companion object {
         val logger = LoggerFactory.getLogger(PaymentExternalSystemAdapter::class.java)
-        val emptyBody = HttpRequest.BodyPublishers.noBody()
         val mapper = ObjectMapper().registerKotlinModule()
     }
 
@@ -40,6 +36,8 @@ class PaymentExternalSystemAdapterImpl(
     private val requestAverageProcessingTime = properties.averageProcessingTime
     private val rateLimitPerSec = properties.rateLimitPerSec
 
+    private val semaphore = Semaphore(parallelRequests)
+
     private val client = HttpClient
         .newBuilder()
         .version(HttpClient.Version.HTTP_2)
@@ -48,142 +46,129 @@ class PaymentExternalSystemAdapterImpl(
         .build()
 
     private val rateLimiter = SlidingWindowRateLimiter(properties.rateLimitPerSec.toLong(), Duration.ofSeconds(1))
-    private val ongoingWindow = OngoingWindow(parallelRequests)
 
     private val maxRetryCount = 3
     private val maxDelay = 1000L
     private val startDelay = 200L
 
     private fun calculateBackOff(attempt: Int): Long {
-
         if (attempt <= 0) {
-            return startDelay;
+            return startDelay
         }
 
-        var factor = 1;
-
+        var factor = 1
         repeat(attempt - 1) {
-            factor *= 2;
+            factor *= 2
         }
 
-        val delay = startDelay * factor;
-
-        if (delay > maxDelay) {
-            return  maxDelay
-        }
-
-        return delay;
+        val delay = startDelay * factor
+        return minOf(delay, maxDelay)
     }
 
     private fun timeOutOrGetAccessByRateLimiter(deadline: Long): Boolean {
-
-        val minSleepMillis = (1000L / rateLimitPerSec.coerceAtLeast(1)); // один квант времени между запросами ~~ 1 / rateLimitPerSec сек
+        val minSleepMillis = (1000L / rateLimitPerSec.coerceAtLeast(1))
 
         while (true) {
-
-            val nowMillis = now();
-
+            val nowMillis = now()
             if (nowMillis >= deadline) {
-                return false;
+                return false
             }
 
             if (rateLimiter.tick()) {
-                return true;
+                return true
             }
 
-            val remaining = deadline - nowMillis;
-
-            val sleepMillis = minOf(minSleepMillis, remaining);
+            val remaining = deadline - nowMillis
+            val sleepMillis = minOf(minSleepMillis, remaining)
 
             if (sleepMillis > 0) {
-                Thread.sleep(sleepMillis);
+                Thread.sleep(sleepMillis)
             }
         }
     }
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
+        logger.warn("[$accountName] Submitting payment request for payment $paymentId")
 
-        logger.warn("[$accountName] Submitting payment request for payment $paymentId");
+        val transactionId = UUID.randomUUID()
 
-        val transactionId = UUID.randomUUID();
-
-        // Вне зависимости от исхода оплаты важно отметить что она была отправлена.
-        // Это требуется сделать ВО ВСЕХ СЛУЧАЯХ, поскольку эта информация используется сервисом тестирования.
         paymentESService.update(paymentId) {
-            it.logSubmission(success = true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt));
+            it.logSubmission(success = true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
         }
 
-        logger.info("[$accountName] Submit: $paymentId , txId: $transactionId");
+        logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
 
-        ongoingWindow.acquire();
+        val acquired = semaphore.tryAcquire(deadline - now(), TimeUnit.MILLISECONDS)
+        if (!acquired) {
+            logger.error("[$accountName] Semaphore timeout for transactionId: $transactionId, paymentId: $paymentId")
+            paymentESService.update(paymentId) {
+                it.logProcessing(false, now(), transactionId, reason = "Semaphore timeout")
+            }
+            return
+        }
 
         if (!timeOutOrGetAccessByRateLimiter(deadline)) {
-
-            logger.error("[$accountName] rate limit wait overwhelmed deadline with transactionId: $transactionId, paymentId: $paymentId");
-
+            logger.error("[$accountName] rate limit wait overwhelmed deadline with transactionId: $transactionId, paymentId: $paymentId")
             paymentESService.update(paymentId) {
-                it.logProcessing(false, now(), transactionId, reason = "rate limit wait overwhelmed deadline");
+                it.logProcessing(false, now(), transactionId, reason = "rate limit wait overwhelmed deadline")
             }
-
-            return;
+            semaphore.release()
+            return
         }
 
         try {
-            var amountOfRetries = 0;
-            val request = HttpRequest.newBuilder().uri (
+            var amountOfRetries = 0
+            val request = HttpRequest.newBuilder().uri(
                 URI("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount"))
-                .POST(emptyBody)
-            .build();
-            val toBlock = deadline - System.currentTimeMillis()
+                .POST(HttpRequest.BodyPublishers.noBody())
+                .timeout(Duration.ofSeconds(30))
+                .build()
 
-            while (deadline - System.currentTimeMillis() >=0 && amountOfRetries < maxRetryCount) {
+            client.sendAsync(request, HttpResponse.BodyHandlers.ofString()).thenApply { response ->
+                try {
+                    val body = try {
+                        mapper.readValue(response.body(), ExternalSysResponse::class.java)
+                    } catch (e: Exception) {
+                        logger.error("[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.statusCode()}, reason: ${response.body()}")
+                        ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
+                    }
 
-                    ++amountOfRetries;
-                    client.sendAsync(request, HttpResponse.BodyHandlers.ofString()).thenApply { response ->
-                        val body = try {
-                            mapper.readValue(response.body(), ExternalSysResponse::class.java)
-                        }catch (e: Exception) {
-                            logger.error("[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.statusCode()}, reason: ${response.body()}")
-                            ExternalSysResponse(transactionId.toString(), paymentId.toString(),false, e.message)
-                        }
+                    logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
 
-                        ongoingWindow.release()
-
-                        logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
+                    paymentESService.update(paymentId) {
+                        it.logProcessing(body.result, now(), transactionId, reason = body.message)
+                    }
 
 
-                        // Здесь мы обновляем состояние оплаты в зависимости от результата в базе данных оплат.
-                        // Это требуется сделать ВО ВСЕХ ИСХОДАХ (успешная оплата / неуспешная / ошибочная ситуация)
-                        paymentESService.update(paymentId) {
-                            it.logProcessing(body.result, now(), transactionId, reason = body.message);
-                        }
-
-                        if (body.result || (amountOfRetries == maxRetryCount)) {
-                            amountOfRetries = maxRetryCount;
-                        }
-
-                        Thread.sleep(calculateBackOff(amountOfRetries));
-
+                } finally {
+                    semaphore.release()
                 }
+            }.exceptionally { throwable ->
+                semaphore.release()
+
+                when (throwable) {
+                    is SocketTimeoutException -> {
+                        logger.error("[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId", throwable)
+                        paymentESService.update(paymentId) {
+                            it.logProcessing(false, now(), transactionId, reason = "Request timeout.")
+                        }
+                    }
+                    else -> {
+                        logger.error("[$accountName] Payment failed for txId: $transactionId, payment: $paymentId", throwable)
+                        paymentESService.update(paymentId) {
+                            it.logProcessing(false, now(), transactionId, reason = throwable.message)
+                        }
+                    }
+                }
+                null
             }
 
-        }
-        catch (e: Exception) {
-            when (e) {
-                is SocketTimeoutException -> {
-                    logger.error("[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId", e)
-                    paymentESService.update(paymentId) {
-                        it.logProcessing(false, now(), transactionId, reason = "Request timeout.")
-                    }
-                }
+        } catch (e: Exception) {
+            semaphore.release()
+            logger.error("[$accountName] Unexpected error for txId: $transactionId, payment: $paymentId", e)
 
-                else -> {
-                    logger.error("[$accountName] Payment failed for txId: $transactionId, payment: $paymentId", e)
-
-                    paymentESService.update(paymentId) {
-                        it.logProcessing(false, now(), transactionId, reason = e.message)
-                    }
-                }
+            paymentESService.update(paymentId) {
+                it.logProcessing(false, now(), transactionId, reason = "Unexpected error: ${e.message}")
             }
         }
     }
