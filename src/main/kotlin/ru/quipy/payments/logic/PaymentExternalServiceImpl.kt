@@ -135,7 +135,7 @@ class PaymentExternalSystemAdapterImpl(
             val toBlock = deadline - System.currentTimeMillis()
             var repeat = true
             while (toBlock >=0 && repeat) {
-                try {
+//                try {
                     ++amountOfRetries;
 
                     val request = HttpRequest.newBuilder()
@@ -167,22 +167,22 @@ class PaymentExternalSystemAdapterImpl(
 
                         Thread.sleep(calculateBackOff(amountOfRetries));
                     }
-                }
+//                }
 
-                catch (e: java.io.InterruptedIOException) {
-
-                    logger.warn("[$accountName] request stopped by a client timeout for transactionId=$transactionId (in attempt $amountOfRetries of $maxRetryCount)")
-
-                    if (amountOfRetries < maxRetryCount && now() < deadline) {
-                        Thread.sleep(calculateBackOff(amountOfRetries))
-                        continue
-                    }
-                    else {
-                        paymentESService.update(paymentId) {
-                            it.logProcessing(false, now(), transactionId, reason = "Client timeout after $maxRetryCount retries.")
-                        }
-                    }
-                }
+//                catch (e: java.io.InterruptedIOException) {
+//
+//                    logger.warn("[$accountName] request stopped by a client timeout for transactionId=$transactionId (in attempt $amountOfRetries of $maxRetryCount)")
+//
+//                    if (amountOfRetries < maxRetryCount && now() < deadline) {
+//                        Thread.sleep(calculateBackOff(amountOfRetries))
+//                        continue
+//                    }
+//                    else {
+//                        paymentESService.update(paymentId) {
+//                            it.logProcessing(false, now(), transactionId, reason = "Client timeout after $maxRetryCount retries.")
+//                        }
+//                    }
+//                }
             }
 
         }

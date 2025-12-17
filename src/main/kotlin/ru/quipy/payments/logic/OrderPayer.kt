@@ -33,8 +33,8 @@ class OrderPayer {
     private lateinit var paymentService: PaymentService
     private lateinit var executorScope: CoroutineScope
     private val paymentExecutor = ThreadPoolExecutor(
-        16,
-        16, // пропускная способность одного потока 1/averageProccesingTime = 1/0,5 = 2 , rps = 100 , 100/2 = 50
+        10000,
+        10000, // пропускная способность одного потока 1/averageProccesingTime = 1/0,5 = 2 , rps = 100 , 100/2 = 50
         0L,
         TimeUnit.MILLISECONDS,
         LinkedBlockingQueue(10_000),
@@ -45,7 +45,7 @@ class OrderPayer {
                                             // очевидно,что даже с учетом того,что наш рпс 100 лучше не просаживать 20 запросов в пустую
     private val processingTimeSec = 1L
 
-    private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec, Duration.ofSeconds(processingTimeSec))
+    private val rateLimiter = SlidingWindowRateLimiter(1100, Duration.ofSeconds(1))
 
     suspend fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long {
         executorScope = CoroutineScope(paymentExecutor.asCoroutineDispatcher())
