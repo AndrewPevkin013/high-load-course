@@ -44,9 +44,9 @@ class OrderPayer {
 
     private val rateLimitPerSec = 1100L // это рейт лимитер для внешней системы - в конфиге у нее 120 рпс - это кол-во запросов,которая ОНА в состоянии принять
                                             // очевидно,что даже с учетом того,что наш рпс 100 лучше не просаживать 20 запросов в пустую
-    private val processingTimeSec = 1
+    private val processingTimeSec = 50L
 
-    private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec, Duration.ofSeconds(processingTimeSec))
+    private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec, Duration.ofSeconds(1))
     fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long {
 
         val toBlock = deadline - System.currentTimeMillis()
