@@ -33,18 +33,18 @@ class OrderPayer {
     private lateinit var paymentService: PaymentService
 
     private val paymentExecutor = ThreadPoolExecutor(
-        10000,
-        10000, // пропускная способность одного потока 1/averageProccesingTime = 1/0,5 = 2 , rps = 100 , 100/2 = 50
+        500,
+        1000, // пропускная способность одного потока 1/averageProccesingTime = 1/0,5 = 2 , rps = 100 , 100/2 = 50
         60L,
         TimeUnit.SECONDS,
-        LinkedBlockingQueue<Runnable>(8_000),
+        LinkedBlockingQueue<Runnable>(20_000),
         NamedThreadFactory("payment-submission-executor"),
         CallerBlockingRejectedExecutionHandler()
     )
 
     private val rateLimitPerSec = 1100L // это рейт лимитер для внешней системы - в конфиге у нее 120 рпс - это кол-во запросов,которая ОНА в состоянии принять
                                             // очевидно,что даже с учетом того,что наш рпс 100 лучше не просаживать 20 запросов в пустую
-    private val processingTimeSec = 50L
+    private val processingTimeSec = 1
 
     private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec, Duration.ofSeconds(processingTimeSec))
     fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long {

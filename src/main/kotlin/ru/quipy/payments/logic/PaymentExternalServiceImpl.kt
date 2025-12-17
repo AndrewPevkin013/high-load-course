@@ -17,6 +17,8 @@ import java.util.*
 import java.util.concurrent.Executors
 import java.util.concurrent.Semaphore
 import java.util.concurrent.TimeUnit
+import kotlin.math.min
+import kotlin.math.pow
 
 class PaymentExternalSystemAdapterImpl(
     private val properties: PaymentAccountProperties,
@@ -36,12 +38,12 @@ class PaymentExternalSystemAdapterImpl(
     private val requestAverageProcessingTime = properties.averageProcessingTime
     private val rateLimitPerSec = properties.rateLimitPerSec
 
-    private val semaphore = Semaphore(parallelRequests)
+    private val semaphore = Semaphore(parallelRequests.coerceAtMost(1000))
 
     private val client = HttpClient
         .newBuilder()
         .version(HttpClient.Version.HTTP_2)
-        .executor(Executors.newFixedThreadPool(2000))
+        .executor(Executors.newFixedThreadPool(200))
         .connectTimeout(Duration.ofMillis(500))
         .build()
 
@@ -51,40 +53,34 @@ class PaymentExternalSystemAdapterImpl(
     private val maxDelay = 1000L
     private val startDelay = 200L
 
-    private fun calculateBackOff(attempt: Int): Long {
-        if (attempt <= 0) {
-            return startDelay
-        }
-
-        var factor = 1
-        repeat(attempt - 1) {
-            factor *= 2
-        }
-
-        val delay = startDelay * factor
-        return minOf(delay, maxDelay)
+    private fun exponentialBackoffDelay(attempt: Int): Long {
+        return minOf((startDelay * 2.0.pow((attempt - 1).toDouble())).toLong(), maxDelay)
     }
 
-    private fun timeOutOrGetAccessByRateLimiter(deadline: Long): Boolean {
+    private fun waitForRateLimitOrTimeout(deadline: Long): Boolean {
         val minSleepMillis = (1000L / rateLimitPerSec.coerceAtLeast(1))
+        var currentTime = now()
 
-        while (true) {
-            val nowMillis = now()
-            if (nowMillis >= deadline) {
-                return false
-            }
-
+        while (currentTime < deadline) {
             if (rateLimiter.tick()) {
                 return true
             }
 
-            val remaining = deadline - nowMillis
+            val remaining = deadline - currentTime
             val sleepMillis = minOf(minSleepMillis, remaining)
 
             if (sleepMillis > 0) {
-                Thread.sleep(sleepMillis)
+                try {
+                    Thread.sleep(sleepMillis)
+                } catch (e: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                    return false
+                }
             }
+
+            currentTime = now()
         }
+        return false
     }
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
@@ -98,7 +94,27 @@ class PaymentExternalSystemAdapterImpl(
 
         logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
 
-        val acquired = semaphore.tryAcquire(deadline - now(), TimeUnit.MILLISECONDS)
+        performRequestWithRetry(paymentId, amount, transactionId, paymentStartedAt, deadline, 1)
+    }
+
+    private fun performRequestWithRetry(
+        paymentId: UUID,
+        amount: Int,
+        transactionId: UUID,
+        paymentStartedAt: Long,
+        deadline: Long,
+        attempt: Int
+    ) {
+        if (now() > deadline || attempt > maxRetryCount) {
+            logger.error("[$accountName] Deadline exceeded or max retries reached for payment $paymentId")
+            paymentESService.update(paymentId) {
+                it.logProcessing(false, now(), transactionId, reason = "Deadline exceeded or max retries reached")
+            }
+            return
+        }
+
+        val timeToBlock = deadline - now()
+        val acquired = semaphore.tryAcquire(timeToBlock, TimeUnit.MILLISECONDS)
         if (!acquired) {
             logger.error("[$accountName] Semaphore timeout for transactionId: $transactionId, paymentId: $paymentId")
             paymentESService.update(paymentId) {
@@ -107,17 +123,16 @@ class PaymentExternalSystemAdapterImpl(
             return
         }
 
-        if (!timeOutOrGetAccessByRateLimiter(deadline)) {
-            logger.error("[$accountName] rate limit wait overwhelmed deadline with transactionId: $transactionId, paymentId: $paymentId")
+        if (!waitForRateLimitOrTimeout(deadline)) {
+            semaphore.release()
+            logger.error("[$accountName] Rate limit wait overwhelmed deadline with transactionId: $transactionId, paymentId: $paymentId")
             paymentESService.update(paymentId) {
                 it.logProcessing(false, now(), transactionId, reason = "rate limit wait overwhelmed deadline")
             }
-            semaphore.release()
             return
         }
 
         try {
-            var amountOfRetries = 0
             val request = HttpRequest.newBuilder().uri(
                 URI("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount"))
                 .POST(HttpRequest.BodyPublishers.noBody())
@@ -139,9 +154,23 @@ class PaymentExternalSystemAdapterImpl(
                         it.logProcessing(body.result, now(), transactionId, reason = body.message)
                     }
 
+                    if (!body.result && attempt < maxRetryCount) {
+                        val delay = exponentialBackoffDelay(attempt)
+                        val remaining = deadline - now()
+                        if (remaining > delay + 100) {
+                            Thread.sleep(delay)
+                            semaphore.release()
+                            performRequestWithRetry(paymentId, amount, transactionId, paymentStartedAt, deadline, attempt + 1)
+                        } else {
+                            semaphore.release()
+                        }
+                    } else {
+                        semaphore.release()
+                    }
 
-                } finally {
+                } catch (e: Exception) {
                     semaphore.release()
+                    logger.error("[$accountName] Error processing response for txId: $transactionId, payment: $paymentId", e)
                 }
             }.exceptionally { throwable ->
                 semaphore.release()
@@ -158,6 +187,15 @@ class PaymentExternalSystemAdapterImpl(
                         paymentESService.update(paymentId) {
                             it.logProcessing(false, now(), transactionId, reason = throwable.message)
                         }
+                    }
+                }
+
+                if (attempt < maxRetryCount) {
+                    val delay = exponentialBackoffDelay(attempt)
+                    val remaining = deadline - now()
+                    if (remaining > delay + 100) {
+                        Thread.sleep(delay)
+                        performRequestWithRetry(paymentId, amount, transactionId, paymentStartedAt, deadline, attempt + 1)
                     }
                 }
                 null
