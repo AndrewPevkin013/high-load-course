@@ -18,6 +18,7 @@ import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.async
+import ru.quipy.common.utils.LeakingBucketRateLimiter
 
 @Service
 class OrderPayer {
@@ -31,33 +32,36 @@ class OrderPayer {
 
     @Autowired
     private lateinit var paymentService: PaymentService
-    private lateinit var executorScope: CoroutineScope
     private val paymentExecutor = ThreadPoolExecutor(
-        10000,
+        200,
         10000, // пропускная способность одного потока 1/averageProccesingTime = 1/0,5 = 2 , rps = 100 , 100/2 = 50
         0L,
         TimeUnit.MILLISECONDS,
-        LinkedBlockingQueue(10_000),
+        LinkedBlockingQueue(50_000),
         NamedThreadFactory("payment-submission-executor"),
         CallerBlockingRejectedExecutionHandler()
     )
     private val rateLimitPerSec = 1100L // это рейт лимитер для внешней системы - в конфиге у нее 120 рпс - это кол-во запросов,которая ОНА в состоянии принять
                                             // очевидно,что даже с учетом того,что наш рпс 100 лучше не просаживать 20 запросов в пустую
     private val processingTimeSec = 1L
+    private val executorScope = CoroutineScope(paymentExecutor.asCoroutineDispatcher())
 
-    private val rateLimiter = SlidingWindowRateLimiter(1100, Duration.ofSeconds(1))
+    private val rateLimiter = LeakingBucketRateLimiter(
+        rate = 1100,
+        window = Duration.ofMillis(1000),
+        bucketSize = 20000
+    )
 
     suspend fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long {
-        executorScope = CoroutineScope(paymentExecutor.asCoroutineDispatcher())
 
         val toBlock = deadline - System.currentTimeMillis()
 
         if (toBlock <= 0) {
-            throw TooManyRequestsError(1000)
+            throw TooManyRequestsError(10_000)
         }
 
         if (!rateLimiter.tick()) {
-            throw TooManyRequestsError(1000)
+            throw TooManyRequestsError(10_000)
         }
 
         val createdAt = System.currentTimeMillis()
