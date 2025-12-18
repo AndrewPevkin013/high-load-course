@@ -9,6 +9,7 @@ import java.net.http.HttpResponse
 import java.util.concurrent.*
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Autowired
+import ru.quipy.common.utils.NamedThreadFactory
 import ru.quipy.common.utils.SlidingWindowRateLimiter
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
@@ -43,7 +44,7 @@ class PaymentExternalSystemAdapterImpl(
 
     private val semaphore = Semaphore(parallelRequests)
 
-    private val scheduler = Executors.newScheduledThreadPool(4)
+    private val scheduler = Executors.newScheduledThreadPool(8, NamedThreadFactory("payment-retry-scheduler"))
 
     override suspend fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         logger.info("[$accountName] Submitting payment request for payment $paymentId")
