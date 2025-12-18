@@ -33,7 +33,7 @@ class OrderPayer {
     @Autowired
     private lateinit var paymentService: PaymentService
     private val paymentExecutor = ThreadPoolExecutor(
-        32,
+        16,
         32, // пропускная способность одного потока 1/averageProccesingTime = 1/0,5 = 2 , rps = 100 , 100/2 = 50
         0L,
         TimeUnit.MILLISECONDS,
@@ -45,9 +45,9 @@ class OrderPayer {
     private val executorScope = CoroutineScope(paymentExecutor.asCoroutineDispatcher())
 
     private val rateLimiter = LeakingBucketRateLimiter(
-        rate = 1050,
+        rate = 1100,
         window = Duration.ofMillis(1000),
-        bucketSize = 22000
+        bucketSize = 20000
     )
 
     suspend fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long {
