@@ -34,7 +34,7 @@ class OrderPayer {
     private lateinit var paymentService: PaymentService
     private val paymentExecutor = ThreadPoolExecutor(
         32,
-        64, // пропускная способность одного потока 1/averageProccesingTime = 1/0,5 = 2 , rps = 100 , 100/2 = 50
+        32, // пропускная способность одного потока 1/averageProccesingTime = 1/0,5 = 2 , rps = 100 , 100/2 = 50
         0L,
         TimeUnit.MILLISECONDS,
         LinkedBlockingQueue(20_000),
