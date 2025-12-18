@@ -37,7 +37,7 @@ class OrderPayer {
         32, // пропускная способность одного потока 1/averageProccesingTime = 1/0,5 = 2 , rps = 100 , 100/2 = 50
         0L,
         TimeUnit.MILLISECONDS,
-        LinkedBlockingQueue(20_000),
+        LinkedBlockingQueue(18_000),
         NamedThreadFactory("payment-submission-executor"),
         CallerBlockingRejectedExecutionHandler()
     )
@@ -49,7 +49,7 @@ class OrderPayer {
     private val rateLimiter = LeakingBucketRateLimiter(
         rate = 1100,
         window = Duration.ofMillis(1000),
-        bucketSize = 20000
+        bucketSize = 18000
     )
 
     suspend fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long {
