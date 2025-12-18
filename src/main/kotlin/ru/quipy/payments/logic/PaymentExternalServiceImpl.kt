@@ -151,7 +151,7 @@ class PaymentExternalSystemAdapterImpl(
 
         val request = HttpRequest.newBuilder()
             .uri(URI.create(url))
-            .timeout(Duration.ofSeconds(30))
+            .timeout(Duration.ofSeconds(20))
             .POST(HttpRequest.BodyPublishers.noBody())
             .build()
 
