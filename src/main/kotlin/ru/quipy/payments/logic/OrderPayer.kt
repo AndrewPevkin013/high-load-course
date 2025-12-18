@@ -33,11 +33,11 @@ class OrderPayer {
     @Autowired
     private lateinit var paymentService: PaymentService
     private val paymentExecutor = ThreadPoolExecutor(
-        100,
-        200, // пропускная способность одного потока 1/averageProccesingTime = 1/0,5 = 2 , rps = 100 , 100/2 = 50
-        60L,
+        10000,
+        10000, // пропускная способность одного потока 1/averageProccesingTime = 1/0,5 = 2 , rps = 100 , 100/2 = 50
+        0L,
         TimeUnit.MILLISECONDS,
-        LinkedBlockingQueue(2_000),
+        LinkedBlockingQueue(8_000),
         NamedThreadFactory("payment-submission-executor"),
         CallerBlockingRejectedExecutionHandler()
     )
