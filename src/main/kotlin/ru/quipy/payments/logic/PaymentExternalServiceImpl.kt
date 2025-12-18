@@ -66,11 +66,17 @@ class PaymentExternalSystemAdapterImpl(
         .register(meterRegistry)
 
 
-    private suspend fun waitRateLimitOrTimeout(deadline: Long): Boolean {
+    private suspend fun waitTimeout(deadline: Long): Boolean {
+
         while (!rateLimiter.tick()) {
-            if (now() >= deadline) return false
+
+            if (now() >= deadline) {
+                return false
+            }
+
             delay(5)
         }
+
         return true
     }
 
@@ -79,6 +85,7 @@ class PaymentExternalSystemAdapterImpl(
     private val baseDelay = 200L
 
     override suspend fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
+
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
         submittedCounter.increment()
         val transactionId = UUID.randomUUID()
@@ -89,7 +96,7 @@ class PaymentExternalSystemAdapterImpl(
 
         logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
 
-        if (!waitRateLimitOrTimeout(deadline)) {
+        if (!waitTimeout(deadline)) {
             logger.error("[$accountName] Rate limit wait exceeded deadline for txId: $transactionId, payment: $paymentId")
             paymentESService.update(paymentId) {
                 it.logProcessing(false, now(), transactionId, reason = "Rate limit wait exceeded deadline.")
@@ -103,9 +110,9 @@ class PaymentExternalSystemAdapterImpl(
             .build()
 
         var attempt = 0
-        var processed = false
+        var isProccesed = false
 
-        while (!processed && attempt < retryCount && now() < deadline) {
+        while (!isProccesed && attempt < retryCount && now() < deadline) {
             attempt++
 
             try {
@@ -113,17 +120,21 @@ class PaymentExternalSystemAdapterImpl(
                 if (remainingTime <= 0) break
 
                 val start = System.currentTimeMillis()
+
                 val response = withTimeoutOrNull(remainingTime) {
                     client.sendAsync(request, HttpResponse.BodyHandlers.ofString()).await()
                 }
 
                 if (response == null) {
+
                     logger.error("[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId, attempt: $attempt")
+
                     if (attempt >= retryCount || now() >= deadline) {
                         paymentESService.update(paymentId) {
                             it.logProcessing(false, now(), transactionId, reason = "Request timeout.")
                         }
-                        processed = true
+
+                        isProccesed = true
                     }
                     continue
                 }
@@ -145,15 +156,15 @@ class PaymentExternalSystemAdapterImpl(
                     paymentESService.update(paymentId) {
                         it.logProcessing(true, now(), transactionId, reason = body.message)
                     }
-                    processed = true
+                    isProccesed = true
                 } else if (body.message == "Temporary error" && attempt < retryCount && now() < deadline) {
                     retryCounter.increment()
-                    delay(exponentialBackoffDelay(attempt))
+                    delay(calculateDelay(attempt))
                 } else {
                     paymentESService.update(paymentId) {
                         it.logProcessing(false, now(), transactionId, reason = body.message)
                     }
-                    processed = true
+                    isProccesed = true
                 }
 
             } catch (e: Exception) {
@@ -168,11 +179,11 @@ class PaymentExternalSystemAdapterImpl(
                 paymentESService.update(paymentId) {
                     it.logProcessing(false, now(), transactionId, reason = e.message)
                 }
-                processed = true
+                isProccesed = true
             }
         }
 
-        if (!processed) {
+        if (!isProccesed) {
             paymentESService.update(paymentId) {
                 it.logProcessing(false, now(), transactionId, reason = "Deadline exceeded.")
             }
@@ -186,7 +197,7 @@ class PaymentExternalSystemAdapterImpl(
 
     override fun name() = properties.accountName
 
-    private fun exponentialBackoffDelay(attempt: Int): Long {
+    private fun calculateDelay(attempt: Int): Long {
         return minOf((baseDelay * 2.0.pow((attempt - 1).toDouble())).toLong(), maxDelay)
     }
 }
