@@ -41,15 +41,13 @@ class OrderPayer {
         NamedThreadFactory("payment-submission-executor"),
         CallerBlockingRejectedExecutionHandler()
     )
-    private val rateLimitPerSec = 1100L // это рейт лимитер для внешней системы - в конфиге у нее 120 рпс - это кол-во запросов,которая ОНА в состоянии принять
-                                            // очевидно,что даже с учетом того,что наш рпс 100 лучше не просаживать 20 запросов в пустую
-    private val processingTimeSec = 1L
+
     private val executorScope = CoroutineScope(paymentExecutor.asCoroutineDispatcher())
 
     private val rateLimiter = LeakingBucketRateLimiter(
         rate = 1100,
         window = Duration.ofMillis(1000),
-        bucketSize = 18000
+        bucketSize = 22000
     )
 
     suspend fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long {
