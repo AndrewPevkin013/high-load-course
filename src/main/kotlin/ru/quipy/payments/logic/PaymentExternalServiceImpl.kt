@@ -2,7 +2,6 @@ package ru.quipy.payments.logic
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
-import kotlinx.coroutines.time.delay
 import java.net.URI
 import java.net.http.HttpClient
 import java.net.http.HttpRequest
@@ -17,7 +16,6 @@ import ru.quipy.payments.api.PaymentAggregate
 import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.*
-import java.util.concurrent.locks.LockSupport
 
 class PaymentExternalSystemAdapterImpl(
     private val properties: PaymentAccountProperties,
@@ -106,15 +104,11 @@ class PaymentExternalSystemAdapterImpl(
         } catch (e: Exception) {
             logger.error("[$accountName] Error processing payment $paymentId (attempt $attempt)", e)
 
-            if (attempt < 3 && now() < deadline - 500) {
+            if (attempt < 3 && now() < deadline - 300) {
                 val delay = calculateBackoff(attempt)
-                try {
-                    Thread.sleep(delay)
-                } catch (ie: InterruptedException) {
-                    Thread.currentThread().interrupt()
-                    return
-                }
-                executePaymentWithRetry(paymentId, amount, transactionId, paymentStartedAt, deadline, attempt + 1)
+                scheduler.schedule({
+                    executePaymentWithRetry(paymentId, amount, transactionId, paymentStartedAt, deadline, attempt + 1)
+                }, delay, TimeUnit.MILLISECONDS)
             } else {
                 paymentESService.update(paymentId) {
                     it.logProcessing(false, now(), transactionId, reason = "Failed after $attempt attempts: ${e.message}")
@@ -124,20 +118,29 @@ class PaymentExternalSystemAdapterImpl(
     }
 
     private fun waitForRateLimit(deadline: Long): Boolean {
-        val startTime = now()
-        var attempts = 0
-        val maxQuickAttempts = 50
+        val minSleep = 1000L / rateLimitPerSec.coerceAtLeast(1)
+        var currentTime = now()
 
-        while (attempts < maxQuickAttempts && now() < deadline) {
+        while (currentTime < deadline) {
             if (rateLimiter.tick()) {
                 return true
             }
 
-            LockSupport.parkNanos(100_000)
-            attempts++
-        }
+            val remaining = deadline - currentTime
+            val sleepTime = minOf(minSleep, remaining)
 
-        return rateLimiter.tick()
+            if (sleepTime > 0) {
+                try {
+                    Thread.sleep(sleepTime)
+                } catch (e: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                    return false
+                }
+            }
+
+            currentTime = now()
+        }
+        return false
     }
 
     private fun executeHttpRequestSync(
