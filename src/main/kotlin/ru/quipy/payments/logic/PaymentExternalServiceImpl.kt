@@ -108,9 +108,13 @@ class PaymentExternalSystemAdapterImpl(
 
             if (attempt < 3 && now() < deadline - 500) {
                 val delay = calculateBackoff(attempt)
-                scheduler.schedule({
-                    executePaymentWithRetry(paymentId, amount, transactionId, paymentStartedAt, deadline, attempt + 1)
-                }, delay, TimeUnit.MILLISECONDS)
+                try {
+                    Thread.sleep(delay)
+                } catch (ie: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                    return
+                }
+                executePaymentWithRetry(paymentId, amount, transactionId, paymentStartedAt, deadline, attempt + 1)
             } else {
                 paymentESService.update(paymentId) {
                     it.logProcessing(false, now(), transactionId, reason = "Failed after $attempt attempts: ${e.message}")
