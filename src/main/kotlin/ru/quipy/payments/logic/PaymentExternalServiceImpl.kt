@@ -104,7 +104,7 @@ class PaymentExternalSystemAdapterImpl(
         } catch (e: Exception) {
             logger.error("[$accountName] Error processing payment $paymentId (attempt $attempt)", e)
 
-            if (attempt < 3 && now() < deadline - 250) {
+            if (attempt < 3 && now() < deadline - 350) {
                 val delay = calculateBackoff(attempt)
                 scheduler.schedule({
                     executePaymentWithRetry(paymentId, amount, transactionId, paymentStartedAt, deadline, attempt + 1)
