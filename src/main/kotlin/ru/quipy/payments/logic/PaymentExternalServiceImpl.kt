@@ -2,6 +2,7 @@ package ru.quipy.payments.logic
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
+import kotlinx.coroutines.time.delay
 import java.net.URI
 import java.net.http.HttpClient
 import java.net.http.HttpRequest
@@ -16,6 +17,7 @@ import ru.quipy.payments.api.PaymentAggregate
 import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.*
+import java.util.concurrent.locks.LockSupport
 
 class PaymentExternalSystemAdapterImpl(
     private val properties: PaymentAccountProperties,
@@ -118,29 +120,20 @@ class PaymentExternalSystemAdapterImpl(
     }
 
     private fun waitForRateLimit(deadline: Long): Boolean {
-        val minSleep = 1000L / rateLimitPerSec.coerceAtLeast(1)
-        var currentTime = now()
+        val startTime = now()
+        var attempts = 0
+        val maxQuickAttempts = 50
 
-        while (currentTime < deadline) {
+        while (attempts < maxQuickAttempts && now() < deadline) {
             if (rateLimiter.tick()) {
                 return true
             }
 
-            val remaining = deadline - currentTime
-            val sleepTime = minOf(minSleep, remaining)
-
-            if (sleepTime > 0) {
-                try {
-                    Thread.sleep(sleepTime)
-                } catch (e: InterruptedException) {
-                    Thread.currentThread().interrupt()
-                    return false
-                }
-            }
-
-            currentTime = now()
+            LockSupport.parkNanos(100_000)
+            attempts++
         }
-        return false
+
+        return rateLimiter.tick()
     }
 
     private fun executeHttpRequestSync(
