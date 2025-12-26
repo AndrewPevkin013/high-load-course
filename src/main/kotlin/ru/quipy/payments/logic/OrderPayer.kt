@@ -33,11 +33,11 @@ class OrderPayer {
     @Autowired
     private lateinit var paymentService: PaymentService
     private val paymentExecutor = ThreadPoolExecutor(
-        32,
-        32, // пропускная способность одного потока 1/averageProccesingTime = 1/0,5 = 2 , rps = 100 , 100/2 = 50
+        50,
+        50,
         0L,
         TimeUnit.MILLISECONDS,
-        LinkedBlockingQueue(10_000),
+        LinkedBlockingQueue(8_000),
         NamedThreadFactory("payment-submission-executor"),
         CallerBlockingRejectedExecutionHandler()
     )
@@ -45,19 +45,42 @@ class OrderPayer {
     private val executorScope = CoroutineScope(paymentExecutor.asCoroutineDispatcher())
 
     private val rateLimiter = LeakingBucketRateLimiter(
-        rate = 1100,
+        rate = 1150,
         window = Duration.ofMillis(1000),
-        bucketSize = 25000
+        bucketSize = 20000
     )
 
-    suspend fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long {
+    private val safetyLimiter = LeakingBucketRateLimiter(
+        rate = 1050,
+        window = Duration.ofMillis(1000),
+        bucketSize = 1000
+    )
 
+    private var lastMetricsCheck = System.currentTimeMillis()
+    private var consecutiveBreaches = 0
+
+    suspend fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long {
+        val now = System.currentTimeMillis()
         val toBlock = deadline - System.currentTimeMillis()
+
         if (paymentExecutor.queue.size > 8000) {
             throw TooManyRequestsError(5_000)
         }
 
+        if (!safetyLimiter.tick()) {
+            logger.debug("Safety limiter triggered for payment $paymentId")
+            throw TooManyRequestsError(5_000)
+        }
+
         if (!rateLimiter.tick()) {
+            consecutiveBreaches++
+
+            if (now - lastMetricsCheck > 5000) {
+                logger.info("OrderPayer metrics: queue=${paymentExecutor.queue.size}, active=${paymentExecutor.activeCount}, breaches=$consecutiveBreaches")
+                lastMetricsCheck = now
+                consecutiveBreaches = 0
+            }
+
             throw TooManyRequestsError(10_000)
         }
 
