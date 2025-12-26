@@ -37,7 +37,7 @@ class PaymentExternalSystemAdapterImpl(
     private val averageProcessingTime = properties.averageProcessingTime.toMillis()
 
     private val client = HttpClient.newBuilder()
-        .executor(Executors.newFixedThreadPool(100))
+        .executor(Executors.newFixedThreadPool(200))
         .version(HttpClient.Version.HTTP_2)
         .build()
 
@@ -157,7 +157,7 @@ class PaymentExternalSystemAdapterImpl(
 
         val request = HttpRequest.newBuilder()
             .uri(URI.create(url))
-            .timeout(Duration.ofSeconds(30))
+            .timeout(Duration.ofSeconds(20))
             .POST(HttpRequest.BodyPublishers.noBody())
             .build()
 
