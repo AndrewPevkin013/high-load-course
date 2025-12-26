@@ -30,8 +30,8 @@ class OrderPayer {
     private lateinit var paymentService: PaymentService
 
     private val paymentExecutor = ThreadPoolExecutor(
-        calcPoolSize(),
-        calcPoolSize(),
+        32,
+        32,
         0L,
         TimeUnit.MILLISECONDS,
         LinkedBlockingQueue(8000),
@@ -55,11 +55,5 @@ class OrderPayer {
             paymentService.submitPaymentRequest(paymentId, amount, createdAt, deadline)
         }
         return createdAt
-    }
-
-    fun calcPoolSize(): Int {
-        val requestedRps = 1000
-        val singleThreadPerfomance = 1 / 10
-        return (requestedRps / singleThreadPerfomance).toInt()
     }
 }
