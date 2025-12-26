@@ -119,27 +119,33 @@ class PaymentExternalSystemAdapterImpl(
     }
 
     private fun waitForRateLimit(deadline: Long): Boolean {
+        val minSleep = 1000L / rateLimitPerSec.coerceAtLeast(1)
+        var currentTime = now()
 
         if (rateLimiter.tick()) {
             return true
         }
 
-        var attempts = 0
-        while (attempts < 10 && now() < deadline) {
+        while (currentTime < deadline) {
             if (rateLimiter.tick()) {
                 return true
             }
 
-            try {
-                Thread.sleep(1)
-            } catch (e: InterruptedException) {
-                Thread.currentThread().interrupt()
-                return false
+            val remaining = deadline - currentTime
+            val sleepTime = minOf(minSleep, remaining)
+
+            if (sleepTime > 0) {
+                try {
+                    Thread.sleep(sleepTime)
+                } catch (e: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                    return false
+                }
             }
 
-            attempts++
+            currentTime = now()
         }
-        return rateLimiter.tick()
+        return false
     }
 
     private fun executeHttpRequestSync(
