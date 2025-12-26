@@ -38,7 +38,7 @@ class PaymentExternalSystemAdapterImpl(
     private val rateLimitPerSec = properties.rateLimitPerSec
 
     private val client = HttpClient.newBuilder()
-        .executor(Executors.newFixedThreadPool(100))
+        .executor(Executors.newFixedThreadPool(2000))
         .version(HttpClient.Version.HTTP_2)
         .build()
 
