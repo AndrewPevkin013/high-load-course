@@ -2,6 +2,7 @@ package ru.quipy.payments.logic
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
+import kotlinx.coroutines.future.await
 import java.net.URI
 import java.net.http.HttpClient
 import java.net.http.HttpRequest
@@ -59,7 +60,7 @@ class PaymentExternalSystemAdapterImpl(
 
         CompletableFuture.runAsync {
             executePaymentWithRetry(paymentId, amount, transactionId, paymentStartedAt, deadline, 1)
-        }
+        }.await()
     }
 
     private fun executePaymentWithRetry(
