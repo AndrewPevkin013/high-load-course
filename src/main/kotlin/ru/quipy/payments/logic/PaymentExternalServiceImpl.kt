@@ -36,7 +36,7 @@ class PaymentExternalSystemAdapterImpl(
     private val rateLimitPerSec = properties.rateLimitPerSec
 
     private val client = HttpClient.newBuilder()
-        .executor(Executors.newFixedThreadPool(2000))
+        .executor(Executors.newFixedThreadPool(100))
         .version(HttpClient.Version.HTTP_2)
         .build()
 
@@ -176,7 +176,7 @@ class PaymentExternalSystemAdapterImpl(
         return when (attempt) {
             1 -> 100L
             2 -> 200L
-            else -> 500L
+            else -> 300L
         }
     }
 
