@@ -37,7 +37,7 @@ class OrderPayer {
         50,
         0L,
         TimeUnit.MILLISECONDS,
-        LinkedBlockingQueue(8_000),
+        LinkedBlockingQueue(10_000),
         NamedThreadFactory("payment-submission-executor"),
         CallerBlockingRejectedExecutionHandler()
     )
@@ -47,7 +47,7 @@ class OrderPayer {
     private val rateLimiter = LeakingBucketRateLimiter(
         rate = 1150,
         window = Duration.ofMillis(1000),
-        bucketSize = 20000
+        bucketSize = 25000
     )
 
     private val safetyLimiter = LeakingBucketRateLimiter(
