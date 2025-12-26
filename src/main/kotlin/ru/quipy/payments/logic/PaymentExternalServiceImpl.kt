@@ -34,6 +34,7 @@ class PaymentExternalSystemAdapterImpl(
     private val accountName = properties.accountName
     private val parallelRequests = properties.parallelRequests
     private val rateLimitPerSec = properties.rateLimitPerSec
+    private val averageProcessingTime = properties.averageProcessingTime.toMillis()
 
     private val client = HttpClient.newBuilder()
         .executor(Executors.newFixedThreadPool(100))
@@ -70,7 +71,7 @@ class PaymentExternalSystemAdapterImpl(
         deadline: Long,
         attempt: Int
     ) {
-        if (now() > deadline) {
+        if (now() > deadline - averageProcessingTime - 1000)  {
             logger.error("[$accountName] Deadline exceeded for payment $paymentId")
             paymentESService.update(paymentId) {
                 it.logProcessing(false, now(), transactionId, reason = "Deadline exceeded")

@@ -47,12 +47,15 @@ class OrderPayer {
     private val rateLimiter = LeakingBucketRateLimiter(
         rate = 1100,
         window = Duration.ofMillis(1000),
-        bucketSize = 20000
+        bucketSize = 25000
     )
 
     suspend fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long {
 
         val toBlock = deadline - System.currentTimeMillis()
+        if (paymentExecutor.queue.size > 8000) {
+            throw TooManyRequestsError(5_000)
+        }
 
         if (!rateLimiter.tick()) {
             throw TooManyRequestsError(10_000)
