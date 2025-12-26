@@ -152,7 +152,7 @@ class PaymentExternalSystemAdapterImpl(
 
         val request = HttpRequest.newBuilder()
             .uri(URI.create(url))
-            .timeout(Duration.ofSeconds(20))
+            .timeout(Duration.ofSeconds(30))
             .POST(HttpRequest.BodyPublishers.noBody())
             .build()
 
@@ -174,9 +174,9 @@ class PaymentExternalSystemAdapterImpl(
 
     private fun calculateBackoff(attempt: Int): Long {
         return when (attempt) {
-            1 -> 100L
-            2 -> 200L
-            else -> 300L
+            1 -> 200L
+            2 -> 400L
+            else -> 800L
         }
     }
 

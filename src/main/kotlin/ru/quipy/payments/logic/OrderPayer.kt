@@ -58,9 +58,9 @@ class OrderPayer {
             throw TooManyRequestsError(8_000)
         }
 
-//        if (toBlock <= 0) {
-//            throw TooManyRequestsError(10_000)
-//        }
+        if (toBlock <= 0) {
+            throw TooManyRequestsError(10_000)
+        }
 
         val createdAt = System.currentTimeMillis()
         executorScope.async {
