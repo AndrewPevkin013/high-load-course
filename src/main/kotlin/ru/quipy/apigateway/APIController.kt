@@ -65,7 +65,7 @@ class APIController {
 
         try {
             val createdAt = orderPayer.processPayment(orderId, order.price, paymentId, deadline)
-            return ResponseEntity.ok(PaymentSubmissionDto(createdAt, paymentId))
+            return ResponseEntity.ok(createdAt?.let { PaymentSubmissionDto(it, paymentId) })
         } catch (e: TooManyRequestsError) {
             return ResponseEntity.status(429).header("Retry-After", e.retryAfterMillis.toString()).build()
         }
