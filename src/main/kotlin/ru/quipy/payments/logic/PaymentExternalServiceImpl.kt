@@ -10,7 +10,6 @@ import java.util.concurrent.*
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Autowired
 import ru.quipy.common.utils.NamedThreadFactory
-import ru.quipy.common.utils.SlidingWindowRateLimiter
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
 import java.net.SocketTimeoutException
@@ -33,19 +32,16 @@ class PaymentExternalSystemAdapterImpl(
     private val serviceName = properties.serviceName
     private val accountName = properties.accountName
     private val parallelRequests = properties.parallelRequests
-    private val rateLimitPerSec = properties.rateLimitPerSec
-    private val averageProcessingTime = properties.averageProcessingTime.toMillis()
 
     private val client = HttpClient.newBuilder()
-        .executor(Executors.newFixedThreadPool(200))
         .version(HttpClient.Version.HTTP_2)
+        .executor(Executors.newFixedThreadPool(100))
+        .connectTimeout(Duration.ofMillis(500))
         .build()
-
-    private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), Duration.ofSeconds(1))
 
     private val semaphore = Semaphore(parallelRequests)
 
-    private val scheduler = Executors.newScheduledThreadPool(4, NamedThreadFactory("payment-retry-scheduler"))
+    private val retryExecutor = Executors.newFixedThreadPool(4, NamedThreadFactory("payment-retry"))
 
     override suspend fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         logger.info("[$accountName] Submitting payment request for payment $paymentId")
@@ -58,97 +54,59 @@ class PaymentExternalSystemAdapterImpl(
 
         logger.info("[$accountName] Submit: $paymentId, txId: $transactionId")
 
-        CompletableFuture.runAsync {
-            executePaymentWithRetry(paymentId, amount, transactionId, paymentStartedAt, deadline, 1)
-        }
+        executePaymentSimple(paymentId, amount, transactionId, deadline)
     }
 
-    private fun executePaymentWithRetry(
+    private fun executePaymentSimple(
         paymentId: UUID,
         amount: Int,
         transactionId: UUID,
-        paymentStartedAt: Long,
-        deadline: Long,
-        attempt: Int
+        deadline: Long
     ) {
-        if (now() > deadline - averageProcessingTime - 1000)  {
-            logger.error("[$accountName] Deadline exceeded for payment $paymentId")
-            paymentESService.update(paymentId) {
-                it.logProcessing(false, now(), transactionId, reason = "Deadline exceeded")
-            }
+        if (now() > deadline) {
+            logFailure(paymentId, transactionId, "Deadline exceeded")
+            return
+        }
+
+        val timeToWait = deadline - now()
+        if (!semaphore.tryAcquire(timeToWait, TimeUnit.MILLISECONDS)) {
+            logFailure(paymentId, transactionId, "Semaphore timeout")
             return
         }
 
         try {
-            if (!waitForRateLimit(deadline)) {
-                logger.error("[$accountName] Rate limit timeout for payment $paymentId")
-                paymentESService.update(paymentId) {
-                    it.logProcessing(false, now(), transactionId, reason = "Rate limit timeout")
-                }
-                return
-            }
-
-            if (!semaphore.tryAcquire(deadline - now(), TimeUnit.MILLISECONDS)) {
-                logger.error("[$accountName] Semaphore timeout for payment $paymentId")
-                paymentESService.update(paymentId) {
-                    it.logProcessing(false, now(), transactionId, reason = "Semaphore timeout")
-                }
-                return
-            }
-
-            try {
-                executeHttpRequestSync(paymentId, amount, transactionId)
-            } finally {
-                semaphore.release()
-            }
-
+            executeHttpRequest(paymentId, amount, transactionId)
         } catch (e: Exception) {
-            logger.error("[$accountName] Error processing payment $paymentId (attempt $attempt)", e)
+            logFailure(paymentId, transactionId, "HTTP error: ${e.message}")
+            trySimpleRetry(paymentId, amount, transactionId, deadline, e)
+        } finally {
+            semaphore.release()
+        }
+    }
 
-            if (attempt < 3 && now() < deadline - 450) {
-                val delay = calculateBackoff(attempt)
-                scheduler.schedule({
-                    executePaymentWithRetry(paymentId, amount, transactionId, paymentStartedAt, deadline, attempt + 1)
-                }, delay, TimeUnit.MILLISECONDS)
-            } else {
-                paymentESService.update(paymentId) {
-                    it.logProcessing(false, now(), transactionId, reason = "Failed after $attempt attempts: ${e.message}")
-                }
+    private fun trySimpleRetry(
+        paymentId: UUID,
+        amount: Int,
+        transactionId: UUID,
+        deadline: Long,
+        originalError: Exception
+    ) {
+        val timeLeft = deadline - now()
+        if (timeLeft > 1000) {
+            retryExecutor.submit {
+                Thread.sleep(200)
+                executePaymentSimple(paymentId, amount, transactionId, deadline)
             }
         }
     }
 
-    private fun waitForRateLimit(deadline: Long): Boolean {
-        val minSleep = 1000L / rateLimitPerSec.coerceAtLeast(1)
-        var currentTime = now()
-
-        if (rateLimiter.tick()) {
-            return true
+    private fun logFailure(paymentId: UUID, transactionId: UUID, reason: String) {
+        paymentESService.update(paymentId) {
+            it.logProcessing(false, now(), transactionId, reason = reason)
         }
-
-        while (currentTime < deadline) {
-            if (rateLimiter.tick()) {
-                return true
-            }
-
-            val remaining = deadline - currentTime
-            val sleepTime = minOf(minSleep, remaining)
-
-            if (sleepTime > 0) {
-                try {
-                    Thread.sleep(sleepTime)
-                } catch (e: InterruptedException) {
-                    Thread.currentThread().interrupt()
-                    return false
-                }
-            }
-
-            currentTime = now()
-        }
-        return false
     }
 
-    private fun executeHttpRequestSync(
+    private fun executeHttpRequest(
         paymentId: UUID,
         amount: Int,
         transactionId: UUID
@@ -174,14 +132,6 @@ class PaymentExternalSystemAdapterImpl(
 
         paymentESService.update(paymentId) {
             it.logProcessing(body.result, now(), transactionId, reason = body.message)
-        }
-    }
-
-    private fun calculateBackoff(attempt: Int): Long {
-        return when (attempt) {
-            1 -> 200L
-            2 -> 400L
-            else -> 800L
         }
     }
 
