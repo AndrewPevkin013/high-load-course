@@ -17,7 +17,7 @@ import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.*
 import kotlin.math.min
-import kotlin.math.p
+import kotlin.math.pow
 
 class PaymentExternalSystemAdapterImpl(
     private val properties: PaymentAccountProperties,
