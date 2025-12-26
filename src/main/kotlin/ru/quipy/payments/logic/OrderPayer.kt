@@ -35,8 +35,8 @@ class OrderPayer {
     private val paymentExecutor = ThreadPoolExecutor(
         200,
         1200,
-        60L,
-        TimeUnit.SECONDS,
+        0,
+        TimeUnit.MILLISECONDS,
         LinkedBlockingQueue(8_000),
         NamedThreadFactory("payment-submission-executor"),
         CallerBlockingRejectedExecutionHandler()
@@ -55,7 +55,7 @@ class OrderPayer {
         val toBlock = deadline - System.currentTimeMillis()
 
         if (!rateLimiter.tick()) {
-            throw TooManyRequestsError(5_000)
+            throw TooManyRequestsError(10_000)
         }
 
 //        if (toBlock <= 0) {
