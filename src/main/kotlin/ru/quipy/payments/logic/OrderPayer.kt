@@ -34,33 +34,33 @@ class OrderPayer {
     private lateinit var paymentService: PaymentService
     private val paymentExecutor = ThreadPoolExecutor(
         32,
-        32, // пропускная способность одного потока 1/averageProccesingTime = 1/0,5 = 2 , rps = 100 , 100/2 = 50
+        32,
         0L,
         TimeUnit.MILLISECONDS,
-        LinkedBlockingQueue(10_000),
+        LinkedBlockingQueue(8_000),
         NamedThreadFactory("payment-submission-executor"),
         CallerBlockingRejectedExecutionHandler()
     )
 
     private val executorScope = CoroutineScope(paymentExecutor.asCoroutineDispatcher())
 
-    private val rateLimiter = LeakingBucketRateLimiter(
-        rate = 1100,
-        window = Duration.ofMillis(1000),
-        bucketSize = 25000
-    )
+//    private val rateLimiter = LeakingBucketRateLimiter(
+//        rate = 1100,
+//        window = Duration.ofMillis(1000),
+//        bucketSize = 25000
+//    )
 
     suspend fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long {
 
         val toBlock = deadline - System.currentTimeMillis()
 
-        if (!rateLimiter.tick()) {
-            throw TooManyRequestsError(10_000)
-        }
+//        if (!rateLimiter.tick()) {
+//            throw TooManyRequestsError(10_000)
+//        }
 
-        if (toBlock <= 0) {
-            throw TooManyRequestsError(10_000)
-        }
+//        if (toBlock <= 0) {
+//            throw TooManyRequestsError(10_000)
+//        }
 
         val createdAt = System.currentTimeMillis()
         executorScope.async {
