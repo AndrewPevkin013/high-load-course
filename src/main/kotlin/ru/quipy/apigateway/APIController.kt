@@ -3,6 +3,7 @@ package ru.quipy.apigateway
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Autowired
+import org.springframework.http.HttpStatus
 import org.springframework.http.ResponseEntity
 import org.springframework.web.bind.annotation.*
 import ru.quipy.orders.repository.OrderRepository
@@ -63,12 +64,11 @@ class APIController {
             it
         } ?: throw IllegalArgumentException("No such order $orderId")
 
-        try {
-            val createdAt = orderPayer.processPayment(orderId, order.price, paymentId, deadline)
-            return ResponseEntity.ok(createdAt?.let { PaymentSubmissionDto(it, paymentId) })
-        } catch (e: TooManyRequestsError) {
-            return ResponseEntity.status(429).header("Retry-After", e.retryAfterMillis.toString()).build()
-        }
+
+        val createdAt =
+            orderPayer.processPayment(orderId, order.price, paymentId, deadline)
+                ?: return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS).build()
+        return ResponseEntity.ok(PaymentSubmissionDto(createdAt, paymentId))
     }
 
     class PaymentSubmissionDto(
@@ -76,5 +76,3 @@ class APIController {
         val transactionId: UUID
     )
 }
-
-class TooManyRequestsError(val retryAfterMillis: Long) : RuntimeException()
