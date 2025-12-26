@@ -7,7 +7,6 @@ import org.springframework.stereotype.Service
 import ru.quipy.apigateway.TooManyRequestsError
 import ru.quipy.common.utils.CallerBlockingRejectedExecutionHandler
 import ru.quipy.common.utils.NamedThreadFactory
-import ru.quipy.common.utils.SlidingWindowRateLimiter
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
 import java.time.Duration
@@ -55,7 +54,7 @@ class OrderPayer {
         val toBlock = deadline - System.currentTimeMillis()
 
         if (!rateLimiter.tick()) {
-            throw TooManyRequestsError(8_000)
+            throw TooManyRequestsError(10_000)
         }
 
         if (toBlock <= 0) {
