@@ -53,12 +53,6 @@ class OrderPayer {
             CallerBlockingRejectedExecutionHandler()
         )
         executorScope = CoroutineScope(paymentExecutor.asCoroutineDispatcher())
-        averageProcessingTime = paymentService.getAllAccountProperties()
-            .maxOf { properties -> properties.averageProcessingTime.toMillis() }
-        rateLimitPerSec = paymentService.getAllAccountProperties()
-            .minOf { properties -> properties.rateLimitPerSec }
-        parallelRequests = paymentService.getAllAccountProperties()
-            .minOf { properties -> properties.parallelRequests }
         rateLimiter =
             LeakingBucketRateLimiter(
                 rate = 1100,
