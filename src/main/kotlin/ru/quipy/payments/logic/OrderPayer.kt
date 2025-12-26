@@ -1,18 +1,21 @@
 package ru.quipy.payments.logic
 
-import io.micrometer.core.instrument.Gauge
-import io.micrometer.core.instrument.Metrics
+import jakarta.annotation.PostConstruct
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.asCoroutineDispatcher
+import kotlinx.coroutines.async
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.stereotype.Service
 import ru.quipy.common.utils.CallerBlockingRejectedExecutionHandler
+import ru.quipy.common.utils.LeakingBucketRateLimiter
 import ru.quipy.common.utils.NamedThreadFactory
-import ru.quipy.common.utils.SlidingWindowRateLimiter
+import ru.quipy.common.utils.RateLimiter
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
 import java.time.Duration
-import java.util.*
+import java.util.UUID
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
@@ -30,30 +33,47 @@ class OrderPayer {
     @Autowired
     private lateinit var paymentService: PaymentService
 
-    private val queue = LinkedBlockingQueue<Runnable>(8_000)
+    private lateinit var paymentExecutor: ThreadPoolExecutor
+    private lateinit var executorScope: CoroutineScope
+    private var averageProcessingTime: Long = 0
+    private var rateLimitPerSec: Int = 0
+    private var parallelRequests: Int = 0
 
-    private val paymentExecutor = ThreadPoolExecutor(
-        200,
-        1200,
-        60L, TimeUnit.SECONDS,
-        queue,
-        NamedThreadFactory("payment-submission-executor"),
-        CallerBlockingRejectedExecutionHandler()
-    )
+    private lateinit var rateLimiter: RateLimiter
 
-    private val rate = 11
-    private val waitTime = 13
-
-    private val slidingWindowRateLimiter = SlidingWindowRateLimiter(1100, Duration.ofSeconds(1))
-
+    @PostConstruct
+    private fun initialize() {
+        paymentExecutor = ThreadPoolExecutor(
+            16,
+            16,
+            0L,
+            TimeUnit.MILLISECONDS,
+            LinkedBlockingQueue(10_000),
+            NamedThreadFactory("payment-submission-executor"),
+            CallerBlockingRejectedExecutionHandler()
+        )
+        executorScope = CoroutineScope(paymentExecutor.asCoroutineDispatcher())
+        averageProcessingTime = paymentService.getAllAccountProperties()
+            .maxOf { properties -> properties.averageProcessingTime.toMillis() }
+        rateLimitPerSec = paymentService.getAllAccountProperties()
+            .minOf { properties -> properties.rateLimitPerSec }
+        parallelRequests = paymentService.getAllAccountProperties()
+            .minOf { properties -> properties.parallelRequests }
+        rateLimiter =
+            LeakingBucketRateLimiter(
+                rate = 1100,
+                window = Duration.ofMillis(1000),
+                bucketSize = 20000
+            )
+    }
 
     suspend fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long {
         val createdAt = System.currentTimeMillis()
-        val toBlock = deadline - createdAt
-        if (!slidingWindowRateLimiter.tickBlocking(Duration.ofMillis(toBlock))) {
-            throw RuntimeException("Rate limit exceeded")
+        if (!rateLimiter.tick()) {
+            throw TooManyRequestsError(10000)
         }
-        paymentExecutor.submit {
+
+        executorScope.async {
             val createdEvent = paymentESService.create {
                 it.create(
                     paymentId,
@@ -65,7 +85,8 @@ class OrderPayer {
 
             paymentService.submitPaymentRequest(paymentId, amount, createdAt, deadline)
         }
-
         return createdAt
     }
 }
+
+class TooManyRequestsError(val millisToRetry: Long) : RuntimeException()
