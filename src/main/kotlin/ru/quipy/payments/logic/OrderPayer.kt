@@ -33,11 +33,11 @@ class OrderPayer {
     @Autowired
     private lateinit var paymentService: PaymentService
     private val paymentExecutor = ThreadPoolExecutor(
-        50,
-        50,
+        16,
+        16,
         0L,
         TimeUnit.MILLISECONDS,
-        LinkedBlockingQueue(10_000),
+        LinkedBlockingQueue(8_000),
         NamedThreadFactory("payment-submission-executor"),
         CallerBlockingRejectedExecutionHandler()
     )
@@ -45,42 +45,19 @@ class OrderPayer {
     private val executorScope = CoroutineScope(paymentExecutor.asCoroutineDispatcher())
 
     private val rateLimiter = LeakingBucketRateLimiter(
-        rate = 1150,
+        rate = 1100,
         window = Duration.ofMillis(1000),
-        bucketSize = 25000
+        bucketSize = 20000
     )
-
-    private val safetyLimiter = LeakingBucketRateLimiter(
-        rate = 1050,
-        window = Duration.ofMillis(1000),
-        bucketSize = 1000
-    )
-
-    private var lastMetricsCheck = System.currentTimeMillis()
-    private var consecutiveBreaches = 0
 
     suspend fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long {
-        val now = System.currentTimeMillis()
-        val toBlock = deadline - System.currentTimeMillis()
 
+        val toBlock = deadline - System.currentTimeMillis()
         if (paymentExecutor.queue.size > 8000) {
             throw TooManyRequestsError(5_000)
         }
 
-        if (!safetyLimiter.tick()) {
-            logger.debug("Safety limiter triggered for payment $paymentId")
-            throw TooManyRequestsError(5_000)
-        }
-
         if (!rateLimiter.tick()) {
-            consecutiveBreaches++
-
-            if (now - lastMetricsCheck > 5000) {
-                logger.info("OrderPayer metrics: queue=${paymentExecutor.queue.size}, active=${paymentExecutor.activeCount}, breaches=$consecutiveBreaches")
-                lastMetricsCheck = now
-                consecutiveBreaches = 0
-            }
-
             throw TooManyRequestsError(10_000)
         }
 
