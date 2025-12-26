@@ -6,7 +6,7 @@ Content-Type: application/json
 {
   "serviceName": "{{serviceName}}",
   "token": "{{token}}",
-  "branch": "hw-09-final-test",
+  "branch": "hw-09-final-final-final",
   "accounts": "acc-12",
   "ratePerSecond": 1000,
   "testCount": 200000,
