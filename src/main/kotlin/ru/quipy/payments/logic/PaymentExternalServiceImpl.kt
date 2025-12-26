@@ -16,6 +16,8 @@ import ru.quipy.payments.api.PaymentAggregate
 import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.*
+import kotlin.math.min
+import kotlin.math.p
 
 class PaymentExternalSystemAdapterImpl(
     private val properties: PaymentAccountProperties,
@@ -45,7 +47,8 @@ class PaymentExternalSystemAdapterImpl(
     private val semaphore = Semaphore(parallelRequests)
 
     private val scheduler = Executors.newScheduledThreadPool(4, NamedThreadFactory("payment-retry-scheduler"))
-
+    private val maxDelayMs = 20000L
+    private val delayBaseMs = 500L
     override suspend fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         logger.info("[$accountName] Submitting payment request for payment $paymentId")
 
@@ -173,11 +176,7 @@ class PaymentExternalSystemAdapterImpl(
     }
 
     private fun calculateBackoff(attempt: Int): Long {
-        return when (attempt) {
-            1 -> 100L
-            2 -> 200L
-            else -> 500L
-        }
+        return minOf((delayBaseMs * 2.0.pow((attempt - 1).toDouble())).toLong(), maxDelayMs)
     }
 
     override fun price() = properties.price
