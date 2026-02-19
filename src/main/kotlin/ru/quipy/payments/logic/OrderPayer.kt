@@ -16,7 +16,7 @@ import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.asCoroutineDispatcher
-import kotlinx.coroutines.async
+import kotlinx.coroutines.launch
 import ru.quipy.common.utils.LeakingBucketRateLimiter
 
 @Service
@@ -62,7 +62,7 @@ class OrderPayer {
         }
 
         val createdAt = System.currentTimeMillis()
-        executorScope.async {
+        executorScope.launch {
             val createdEvent = paymentESService.create {
                 it.create(paymentId, orderId, amount)
             }
