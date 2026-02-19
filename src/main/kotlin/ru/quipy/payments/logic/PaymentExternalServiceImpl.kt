@@ -45,7 +45,7 @@ class PaymentExternalSystemAdapterImpl(
 
     private val semaphore = Semaphore(parallelRequests)
 
-    private val scheduler = Executors.newScheduledThreadPool(100, NamedThreadFactory("payment-retry-scheduler"))
+    private val scheduler = Executors.newScheduledThreadPool(8, NamedThreadFactory("payment-retry-scheduler"))
 
     override suspend fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         logger.info("[$accountName] Submitting payment request for payment $paymentId")
