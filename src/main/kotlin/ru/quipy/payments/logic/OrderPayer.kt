@@ -54,11 +54,11 @@ class OrderPayer {
         val toBlock = deadline - System.currentTimeMillis()
 
         if (!rateLimiter.tick()) {
-            throw TooManyRequestsError(10_000)
+            throw TooManyRequestsError(1000)
         }
 
         if (toBlock <= 0) {
-            throw TooManyRequestsError(10_000)
+            throw TooManyRequestsError(1000)
         }
 
         val createdAt = System.currentTimeMillis()
