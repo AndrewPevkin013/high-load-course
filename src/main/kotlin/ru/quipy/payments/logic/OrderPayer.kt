@@ -44,9 +44,9 @@ class OrderPayer {
     private val executorScope = CoroutineScope(paymentExecutor.asCoroutineDispatcher())
 
     private val rateLimiter = LeakingBucketRateLimiter(
-        rate = 1100,
-        window = Duration.ofMillis(1000),
-        bucketSize = 20000
+        rate = 2000,
+        window = Duration.ofMillis(1500),
+        bucketSize = 15000
     )
 
     suspend fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long {
@@ -54,11 +54,11 @@ class OrderPayer {
         val toBlock = deadline - System.currentTimeMillis()
 
         if (!rateLimiter.tick()) {
-            throw TooManyRequestsError(1000)
+            throw TooManyRequestsError(10_000)
         }
 
         if (toBlock <= 0) {
-            throw TooManyRequestsError(1000)
+            throw TooManyRequestsError(10_000)
         }
 
         val createdAt = System.currentTimeMillis()
