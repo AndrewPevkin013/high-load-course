@@ -14,9 +14,7 @@ import java.util.*
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.asCoroutineDispatcher
-import kotlinx.coroutines.launch
+import kotlinx.coroutines.*
 import ru.quipy.common.utils.LeakingBucketRateLimiter
 
 @Service
@@ -32,43 +30,60 @@ class OrderPayer {
     @Autowired
     private lateinit var paymentService: PaymentService
     private val paymentExecutor = ThreadPoolExecutor(
-        32,
-        32,
+        64,
+        64,
         0L,
         TimeUnit.MILLISECONDS,
-        LinkedBlockingQueue(10_000),
+        LinkedBlockingQueue(20_000),
         NamedThreadFactory("payment-submission-executor"),
         CallerBlockingRejectedExecutionHandler()
     )
 
-    private val executorScope = CoroutineScope(paymentExecutor.asCoroutineDispatcher())
+    private val executorScope = CoroutineScope(paymentExecutor.asCoroutineDispatcher() + SupervisorJob())
 
     private val rateLimiter = LeakingBucketRateLimiter(
-        rate = 2100,
+        rate = 4000,
         window = Duration.ofMillis(1000),
-        bucketSize = 20000
+        bucketSize = 4000
     )
 
     suspend fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long {
 
-        val toBlock = deadline - System.currentTimeMillis()
-
-        if (!rateLimiter.tick()) {
-            throw TooManyRequestsError(10_000)
-        }
+        val now = System.currentTimeMillis()
+        val toBlock = deadline - now
 
         if (toBlock <= 0) {
-            throw TooManyRequestsError(10_000)
+            logger.warn("Deadline already exceeded for payment $paymentId")
+            throw TooManyRequestsError(1000)
+        }
+        val rateLimitAcquired = try {
+            withTimeout(toBlock) {
+                while (!rateLimiter.tick()) {
+                    delay(1)
+                }
+                true
+            }
+        } catch (e: TimeoutCancellationException) {
+            false
+        }
+        if (!rateLimitAcquired) {
+            logger.warn("Rate limit timeout for payment $paymentId")
+            throw TooManyRequestsError(250)
         }
 
         val createdAt = System.currentTimeMillis()
         executorScope.launch {
-            val createdEvent = paymentESService.create {
-                it.create(paymentId, orderId, amount)
+            try {
+                val createdEvent = paymentESService.create {
+                    it.create(paymentId, orderId, amount)
+                }
+                logger.debug("Payment ${createdEvent.paymentId} for order $orderId created.")
+                paymentService.submitPaymentRequest(paymentId, amount, createdAt, deadline)
+            } catch (e: Exception) {
+                logger.error("Failed to process payment $paymentId", e)
             }
-            logger.trace("Payment ${createdEvent.paymentId} for order $orderId created.")
-            paymentService.submitPaymentRequest(paymentId, amount, createdAt, deadline)
         }
+
         return createdAt
     }
 }
