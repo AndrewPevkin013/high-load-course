@@ -14,8 +14,8 @@ import java.util.*
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.*
-import ru.quipy.common.utils.LeakingBucketRateLimiter
 
 @Service
 class OrderPayer {
@@ -29,12 +29,15 @@ class OrderPayer {
 
     @Autowired
     private lateinit var paymentService: PaymentService
+    private val pendingRequests = AtomicInteger(0)
+    private val maxPendingRequests = 4000
+
     private val paymentExecutor = ThreadPoolExecutor(
         64,
         64,
         0L,
         TimeUnit.MILLISECONDS,
-        LinkedBlockingQueue(20_000),
+        LinkedBlockingQueue(10_000),
         NamedThreadFactory("payment-submission-executor"),
         CallerBlockingRejectedExecutionHandler()
     )
@@ -56,6 +59,10 @@ class OrderPayer {
             logger.warn("Deadline already exceeded for payment $paymentId")
             throw TooManyRequestsError(1000)
         }
+        if (pendingRequests.get() >= maxPendingRequests) {
+            logger.warn("Queue is full for payment $paymentId, pending: ${pendingRequests.get()}")
+            throw TooManyRequestsError(100)
+        }
         val rateLimitAcquired = try {
             withTimeout(toBlock) {
                 while (!rateLimiter.tick()) {
@@ -66,24 +73,35 @@ class OrderPayer {
         } catch (e: TimeoutCancellationException) {
             false
         }
+
         if (!rateLimitAcquired) {
             logger.warn("Rate limit timeout for payment $paymentId")
             throw TooManyRequestsError(250)
         }
 
         val createdAt = System.currentTimeMillis()
+        pendingRequests.incrementAndGet()
         executorScope.launch {
             try {
-                val createdEvent = paymentESService.create {
-                    it.create(paymentId, orderId, amount)
+                val createdEvent = withTimeout(500) {
+                    paymentESService.create {
+                        it.create(paymentId, orderId, amount)
+                    }
                 }
-                logger.debug("Payment ${createdEvent.paymentId} for order $orderId created.")
+
+                logger.debug("Payment {} for order {} created. Pending: {}",
+                    createdEvent.paymentId, orderId, pendingRequests.get())
+
                 paymentService.submitPaymentRequest(paymentId, amount, createdAt, deadline)
+
+            } catch (e: TimeoutCancellationException) {
+                logger.error("Timeout creating payment $paymentId")
             } catch (e: Exception) {
                 logger.error("Failed to process payment $paymentId", e)
+            } finally {
+                pendingRequests.decrementAndGet()
             }
         }
-
         return createdAt
     }
 }
