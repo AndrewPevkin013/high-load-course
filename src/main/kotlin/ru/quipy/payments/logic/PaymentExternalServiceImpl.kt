@@ -39,9 +39,8 @@ class PaymentExternalSystemAdapterImpl(
     private val rateLimitPerSec = properties.rateLimitPerSec
 
     private val client = HttpClient.newBuilder()
-        .executor(Executors.newFixedThreadPool(parallelRequests * 2))
+        .executor(Executors.newFixedThreadPool(parallelRequests))
         .version(HttpClient.Version.HTTP_2)
-        .connectTimeout(Duration.ofSeconds(5))
         .build()
 
     private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), Duration.ofSeconds(1))
