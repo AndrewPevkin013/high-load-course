@@ -45,8 +45,8 @@ class OrderPayer {
 
     private val rateLimiter = LeakingBucketRateLimiter(
         rate = 2000,
-        window = Duration.ofMillis(1500),
-        bucketSize = 15000
+        window = Duration.ofMillis(500),
+        bucketSize = 25000
     )
 
     suspend fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long {
