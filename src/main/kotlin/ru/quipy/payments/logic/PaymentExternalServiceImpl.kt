@@ -44,7 +44,7 @@ class PaymentExternalSystemAdapterImpl(
         .connectTimeout(Duration.ofSeconds(5))
         .build()
 
-    private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), Duration.ofSeconds(1))
+//    private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), Duration.ofSeconds(1))
 
     private val semaphore = Semaphore(parallelRequests)
 
@@ -88,15 +88,15 @@ class PaymentExternalSystemAdapterImpl(
         }
 
         try {
-            if (!waitForRateLimitAsync(deadline)) {
-                logger.warn("[$accountName] Rate limit timeout for payment $paymentId")
-                withContext(Dispatchers.IO) {
-                    paymentESService.update(paymentId) {
-                        it.logProcessing(false, now(), transactionId, reason = "Rate limit timeout")
-                    }
-                }
-                return
-            }
+//            if (!waitForRateLimitAsync(deadline)) {
+//                logger.warn("[$accountName] Rate limit timeout for payment $paymentId")
+//                withContext(Dispatchers.IO) {
+//                    paymentESService.update(paymentId) {
+//                        it.logProcessing(false, now(), transactionId, reason = "Rate limit timeout")
+//                    }
+//                }
+//                return
+//            }
 
             val acquired = try {
                 withTimeout(deadline - now()) {
@@ -140,17 +140,17 @@ class PaymentExternalSystemAdapterImpl(
         }
     }
 
-    private suspend fun waitForRateLimitAsync(deadline: Long): Boolean {
-        val checkInterval = 1L
-
-        while (now() < deadline) {
-            if (rateLimiter.tick()) {
-                return true
-            }
-            delay(checkInterval)
-        }
-        return false
-    }
+//    private suspend fun waitForRateLimitAsync(deadline: Long): Boolean {
+//        val checkInterval = 1L
+//
+//        while (now() < deadline) {
+//            if (rateLimiter.tick()) {
+//                return true
+//            }
+//            delay(checkInterval)
+//        }
+//        return false
+//    }
 
     private suspend fun executeHttpRequestAsync(
         paymentId: UUID,
