@@ -143,7 +143,7 @@ class PaymentExternalSystemAdapterImpl(
     private suspend fun waitForRateLimitAsync(deadline: Long): Boolean {
         val checkInterval = 1L
 
-        while (currentTimeMillis() < deadline) {
+        while (now() < deadline) {
             if (rateLimiter.tick()) {
                 return true
             }
