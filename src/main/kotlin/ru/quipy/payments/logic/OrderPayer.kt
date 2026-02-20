@@ -44,7 +44,7 @@ class OrderPayer {
     private val executorScope = CoroutineScope(paymentExecutor.asCoroutineDispatcher())
 
     private val rateLimiter = LeakingBucketRateLimiter(
-        rate = 1500,
+        rate = 1100,
         window = Duration.ofMillis(1000),
         bucketSize = 20000
     )
