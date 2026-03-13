@@ -2,21 +2,20 @@ package ru.quipy.payments.logic
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
+import kotlinx.coroutines.*
 import kotlinx.coroutines.future.await
 import java.net.URI
 import java.net.http.HttpClient
 import java.net.http.HttpRequest
 import java.net.http.HttpResponse
-import java.util.concurrent.*
-import org.slf4j.LoggerFactory
-import org.springframework.beans.factory.annotation.Autowired
-import ru.quipy.common.utils.NamedThreadFactory
-import ru.quipy.common.utils.SlidingWindowRateLimiter
-import ru.quipy.core.EventSourcingService
-import ru.quipy.payments.api.PaymentAggregate
-import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.*
+import java.util.concurrent.atomic.AtomicInteger
+import org.slf4j.LoggerFactory
+import org.springframework.beans.factory.annotation.Autowired
+import ru.quipy.common.utils.LeakingBucketRateLimiter
+import ru.quipy.core.EventSourcingService
+import ru.quipy.payments.api.PaymentAggregate
 
 class PaymentExternalSystemAdapterImpl(
     private val properties: PaymentAccountProperties,
@@ -37,33 +36,39 @@ class PaymentExternalSystemAdapterImpl(
     private val rateLimitPerSec = properties.rateLimitPerSec
 
     private val client = HttpClient.newBuilder()
-        .executor(Executors.newFixedThreadPool(100))
         .version(HttpClient.Version.HTTP_2)
         .build()
 
-    private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), Duration.ofSeconds(1))
+    private val rateLimiter = LeakingBucketRateLimiter(
+        rate = rateLimitPerSec.toLong(),
+        window = Duration.ofSeconds(1),
+        bucketSize = (rateLimitPerSec * 2).coerceAtLeast(1)
+    )
 
-    private val semaphore = Semaphore(parallelRequests)
+    private val ongoingRequests = AtomicInteger(0)
 
-    private val scheduler = Executors.newScheduledThreadPool(4, NamedThreadFactory("payment-retry-scheduler"))
+    private fun remainingTime(deadline: Long): Long = deadline - now()
 
     override suspend fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
-        logger.info("[$accountName] Submitting payment request for payment $paymentId")
+        metricsReporter.recordPaymentStarted(accountName)
+        logger.debug("[$accountName] Submitting payment request for payment $paymentId")
 
         val transactionId = UUID.randomUUID()
 
-        paymentESService.update(paymentId) {
-            it.logSubmission(success = true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
+        val startEs = System.currentTimeMillis()
+        withContext(Dispatchers.IO) {
+            paymentESService.update(paymentId) {
+                it.logSubmission(success = true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
+            }
         }
+        metricsReporter.recordEsUpdateDuration(System.currentTimeMillis() - startEs)
 
-        logger.info("[$accountName] Submit: $paymentId, txId: $transactionId")
+        logger.debug("[$accountName] Submit: $paymentId, txId: $transactionId")
 
-        CompletableFuture.runAsync {
-            executePaymentWithRetry(paymentId, amount, transactionId, paymentStartedAt, deadline, 1)
-        }.await()
+        executePaymentWithRetry(paymentId, amount, transactionId, paymentStartedAt, deadline, 1)
     }
 
-    private fun executePaymentWithRetry(
+    private suspend fun executePaymentWithRetry(
         paymentId: UUID,
         amount: Int,
         transactionId: UUID,
@@ -71,113 +76,149 @@ class PaymentExternalSystemAdapterImpl(
         deadline: Long,
         attempt: Int
     ) {
-        if (now() > deadline) {
-            logger.error("[$accountName] Deadline exceeded for payment $paymentId")
-            paymentESService.update(paymentId) {
-                it.logProcessing(false, now(), transactionId, reason = "Deadline exceeded")
+        if (remainingTime(deadline) <= 0) {
+            logger.warn("[$accountName] Deadline exceeded for payment $paymentId")
+            metricsReporter.recordDeadlineExceeded(accountName)
+            metricsReporter.incrementRetry(accountName, RetryCause.DEADLINE)
+            withContext(Dispatchers.IO) {
+                val startEs = System.currentTimeMillis()
+                paymentESService.update(paymentId) {
+                    it.logProcessing(false, now(), transactionId, reason = "Deadline exceeded")
+                }
+                metricsReporter.recordEsUpdateDuration(System.currentTimeMillis() - startEs)
+            }
+            return
+        }
+
+        // Rate limiter
+        val rateAllowed = rateLimiter.tick()
+        metricsReporter.recordRateLimiterResult(accountName, rateAllowed)
+        if (!rateAllowed) {
+            logger.warn("[$accountName] Rate limit exceeded for payment $paymentId")
+            metricsReporter.incrementRetry(accountName, RetryCause.RATE_LIMITER)
+            withContext(Dispatchers.IO) {
+                val startEs = System.currentTimeMillis()
+                paymentESService.update(paymentId) {
+                    it.logProcessing(false, now(), transactionId, reason = "Rate limit exceeded")
+                }
+                metricsReporter.recordEsUpdateDuration(System.currentTimeMillis() - startEs)
+            }
+            return
+        }
+
+        if (ongoingRequests.incrementAndGet() > parallelRequests) {
+            ongoingRequests.decrementAndGet()
+            logger.warn("[$accountName] Too many parallel requests for payment $paymentId")
+            metricsReporter.recordParallelLimitBlocked(accountName)
+
+            if (attempt < 3 && remainingTime(deadline) > 500) {
+                delay(calculateBackoff(attempt))
+                executePaymentWithRetry(paymentId, amount, transactionId, paymentStartedAt, deadline, attempt + 1)
+            } else {
+                metricsReporter.incrementRetry(accountName, RetryCause.PARALLEL_LIMIT)
+                withContext(Dispatchers.IO) {
+                    val startEs = System.currentTimeMillis()
+                    paymentESService.update(paymentId) {
+                        it.logProcessing(false, now(), transactionId, reason = "Too many parallel requests")
+                    }
+                    metricsReporter.recordEsUpdateDuration(System.currentTimeMillis() - startEs)
+                }
             }
             return
         }
 
         try {
-            if (!waitForRateLimit(deadline)) {
-                logger.error("[$accountName] Rate limit timeout for payment $paymentId")
-                paymentESService.update(paymentId) {
-                    it.logProcessing(false, now(), transactionId, reason = "Rate limit timeout")
+            val timeout = remainingTime(deadline).coerceIn(1, 30000)
+            metricsReporter.updateCurrentTimeout(accountName, timeout)
+
+            val url = "http://$paymentProviderHostPort/external/process?" +
+                    "serviceName=$serviceName&token=$token&accountName=$accountName&" +
+                    "transactionId=$transactionId&paymentId=$paymentId&amount=$amount"
+
+            val request = HttpRequest.newBuilder()
+                .uri(URI.create(url))
+                .timeout(Duration.ofMillis(timeout))
+                .POST(HttpRequest.BodyPublishers.noBody())
+                .build()
+
+            val httpStart = System.currentTimeMillis()
+            val response = try {
+                withTimeout(timeout) {
+                    client.sendAsync(request, HttpResponse.BodyHandlers.ofString()).await()
                 }
-                return
+            } catch (e: TimeoutCancellationException) {
+                metricsReporter.recordHttpResponse(accountName, -1)
+                metricsReporter.recordHttpRequestDuration(accountName, System.currentTimeMillis() - httpStart)
+                metricsReporter.incrementRetry(accountName, RetryCause.TIMEOUT)
+                logger.error("[$accountName] HTTP timeout for payment $paymentId")
+                throw e
+            }
+            val httpDuration = System.currentTimeMillis() - httpStart
+            metricsReporter.recordHttpRequestDuration(accountName, httpDuration)
+            metricsReporter.recordHttpResponse(accountName, response.statusCode())
+
+            val body = try {
+                mapper.readValue(response.body(), ExternalSysResponse::class.java)
+            } catch (e: Exception) {
+                logger.error("[$accountName] Parse error for payment $paymentId: ${response.body()}")
+                metricsReporter.recordParseError(accountName)
+                metricsReporter.incrementRetry(accountName, RetryCause.PARSE_ERROR)
+                ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
             }
 
-            if (!semaphore.tryAcquire(deadline - now(), TimeUnit.MILLISECONDS)) {
-                logger.error("[$accountName] Semaphore timeout for payment $paymentId")
+            logger.debug("[$accountName] Payment result for txId: $transactionId, succeeded: ${body.result}")
+
+            val startEs = System.currentTimeMillis()
+            withContext(Dispatchers.IO) {
                 paymentESService.update(paymentId) {
-                    it.logProcessing(false, now(), transactionId, reason = "Semaphore timeout")
+                    it.logProcessing(body.result, now(), transactionId, reason = body.message)
                 }
-                return
             }
+            metricsReporter.recordEsUpdateDuration(System.currentTimeMillis() - startEs)
 
-            try {
-                executeHttpRequestSync(paymentId, amount, transactionId)
-            } finally {
-                semaphore.release()
+            if (!body.result && attempt < 3 && remainingTime(deadline) > 500) {
+                val cause = when (response.statusCode()) {
+                    429 -> RetryCause.HTTP_429
+                    in 400..499 -> RetryCause.HTTP_4XX
+                    in 500..599 -> RetryCause.HTTP_5XX
+                    else -> RetryCause.UNKNOWN
+                }
+                metricsReporter.incrementRetry(accountName, cause)
+                delay(calculateBackoff(attempt))
+                executePaymentWithRetry(paymentId, amount, transactionId, paymentStartedAt, deadline, attempt + 1)
             }
-
         } catch (e: Exception) {
             logger.error("[$accountName] Error processing payment $paymentId (attempt $attempt)", e)
+            val cause = when (e) {
+                is TimeoutCancellationException -> RetryCause.TIMEOUT
+                is java.net.http.HttpTimeoutException -> RetryCause.TIMEOUT
+                is java.net.ConnectException -> RetryCause.NETWORK_ERROR
+                else -> RetryCause.UNKNOWN
+            }
+            metricsReporter.incrementRetry(accountName, cause)
 
-            if (attempt < 3 && now() < deadline - 450) {
-                val delay = calculateBackoff(attempt)
-                scheduler.schedule({
-                    executePaymentWithRetry(paymentId, amount, transactionId, paymentStartedAt, deadline, attempt + 1)
-                }, delay, TimeUnit.MILLISECONDS)
+            if (attempt < 3 && remainingTime(deadline) > 500) {
+                delay(calculateBackoff(attempt))
+                executePaymentWithRetry(paymentId, amount, transactionId, paymentStartedAt, deadline, attempt + 1)
             } else {
-                paymentESService.update(paymentId) {
-                    it.logProcessing(false, now(), transactionId, reason = "Failed after $attempt attempts: ${e.message}")
+                val startEs = System.currentTimeMillis()
+                withContext(Dispatchers.IO) {
+                    paymentESService.update(paymentId) {
+                        it.logProcessing(false, now(), transactionId, reason = "Failed after $attempt attempts: ${e.message}")
+                    }
                 }
+                metricsReporter.recordEsUpdateDuration(System.currentTimeMillis() - startEs)
             }
-        }
-    }
-
-    private fun waitForRateLimit(deadline: Long): Boolean {
-        val minSleep = 1000L / rateLimitPerSec.coerceAtLeast(1)
-        var currentTime = now()
-
-        while (currentTime < deadline) {
-            if (rateLimiter.tick()) {
-                return true
-            }
-
-            val remaining = deadline - currentTime
-            val sleepTime = minOf(minSleep, remaining)
-
-            if (sleepTime > 0) {
-                try {
-                    Thread.sleep(sleepTime)
-                } catch (e: InterruptedException) {
-                    Thread.currentThread().interrupt()
-                    return false
-                }
-            }
-
-            currentTime = now()
-        }
-        return false
-    }
-
-    private fun executeHttpRequestSync(
-        paymentId: UUID,
-        amount: Int,
-        transactionId: UUID
-    ) {
-        val url = "http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount"
-
-        val request = HttpRequest.newBuilder()
-            .uri(URI.create(url))
-            .timeout(Duration.ofSeconds(30))
-            .POST(HttpRequest.BodyPublishers.noBody())
-            .build()
-
-        val response = client.send(request, HttpResponse.BodyHandlers.ofString())
-
-        val body = try {
-            mapper.readValue(response.body(), ExternalSysResponse::class.java)
-        } catch (e: Exception) {
-            logger.error("[$accountName] Parse error for payment $paymentId: ${response.body()}")
-            ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
-        }
-
-        logger.info("[$accountName] Payment result for txId: $transactionId, succeeded: ${body.result}")
-
-        paymentESService.update(paymentId) {
-            it.logProcessing(body.result, now(), transactionId, reason = body.message)
+        } finally {
+            ongoingRequests.decrementAndGet()
         }
     }
 
     private fun calculateBackoff(attempt: Int): Long {
         return when (attempt) {
-            1 -> 200L
-            2 -> 400L
-            else -> 800L
+            1 -> 100L
+            2 -> 200L
+            else -> 400L
         }
     }
 

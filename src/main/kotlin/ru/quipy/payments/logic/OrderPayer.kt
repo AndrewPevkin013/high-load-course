@@ -5,19 +5,17 @@ import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.stereotype.Service
 import ru.quipy.apigateway.TooManyRequestsError
-import ru.quipy.common.utils.CallerBlockingRejectedExecutionHandler
 import ru.quipy.common.utils.NamedThreadFactory
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
-import java.time.Duration
 import java.util.*
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.asCoroutineDispatcher
-import kotlinx.coroutines.async
-import ru.quipy.common.utils.LeakingBucketRateLimiter
+import kotlinx.coroutines.launch
+import jakarta.annotation.PostConstruct
 
 @Service
 class OrderPayer {
@@ -31,41 +29,39 @@ class OrderPayer {
 
     @Autowired
     private lateinit var paymentService: PaymentService
+
+    @Autowired
+    private lateinit var metricsReporter: MetricsReporter
+
     private val paymentExecutor = ThreadPoolExecutor(
-        32,
-        32,
+        50,
+        50,
         0L,
         TimeUnit.MILLISECONDS,
-        LinkedBlockingQueue(10_000),
+        LinkedBlockingQueue(30_000),
         NamedThreadFactory("payment-submission-executor"),
-        CallerBlockingRejectedExecutionHandler()
     )
 
     private val executorScope = CoroutineScope(paymentExecutor.asCoroutineDispatcher())
 
-    private val rateLimiter = LeakingBucketRateLimiter(
-        rate = 1100,
-        window = Duration.ofMillis(1000),
-        bucketSize = 20000
-    )
+    @PostConstruct
+    fun init() {
+        metricsReporter.registerExecutorMetrics(paymentExecutor)
+    }
 
     suspend fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long {
-
-        val toBlock = deadline - System.currentTimeMillis()
-
-        if (!rateLimiter.tick()) {
+        val now = System.currentTimeMillis()
+        if (now >= deadline) {
             throw TooManyRequestsError(10_000)
         }
 
-        if (toBlock <= 0) {
-            throw TooManyRequestsError(10_000)
-        }
-
-        val createdAt = System.currentTimeMillis()
-        executorScope.async {
+        val createdAt = now
+        executorScope.launch {
+            val startEs = System.currentTimeMillis()
             val createdEvent = paymentESService.create {
                 it.create(paymentId, orderId, amount)
             }
+            metricsReporter.recordEsUpdateDuration(System.currentTimeMillis() - startEs)
             logger.trace("Payment ${createdEvent.paymentId} for order $orderId created.")
             paymentService.submitPaymentRequest(paymentId, amount, createdAt, deadline)
         }
