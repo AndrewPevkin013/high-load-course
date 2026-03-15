@@ -8,6 +8,7 @@ import org.slf4j.Logger
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.stereotype.Service
+import ru.quipy.common.utils.CallerBlockingRejectedExecutionHandler
 import ru.quipy.common.utils.NamedThreadFactory
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
@@ -30,13 +31,13 @@ class OrderPayer(private val dbScope: CoroutineScope) {
     private lateinit var paymentService: PaymentService
 
     private val paymentExecutor = ThreadPoolExecutor(
-        50,
         100,
+        1200,
         70000,
         TimeUnit.MILLISECONDS,
-        LinkedBlockingQueue(5500),
+        LinkedBlockingQueue(20000),
         NamedThreadFactory("payment-submission-executor"),
-        ThreadPoolExecutor.DiscardOldestPolicy()
+        CallerBlockingRejectedExecutionHandler()
     )
     val executorScope = CoroutineScope(SupervisorJob() + paymentExecutor.asCoroutineDispatcher())
 
@@ -45,7 +46,6 @@ class OrderPayer(private val dbScope: CoroutineScope) {
 
         executorScope.launch {
             if (now() >= deadline) {
-                logger.warn("Payment $paymentId deadline already exceeded, skipping")
                 return@launch
             }
 

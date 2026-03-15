@@ -27,9 +27,7 @@ import java.util.concurrent.TimeUnit
 
 
 @Configuration
-class PaymentAccountsConfig (
-    @Autowired val meterRegistry: MeterRegistry
-) {
+class PaymentAccountsConfig {
     companion object {
         private val javaClient = HttpClient.newBuilder().build()
         private val mapper = ObjectMapper().registerKotlinModule().registerModules(JavaTimeModule())
