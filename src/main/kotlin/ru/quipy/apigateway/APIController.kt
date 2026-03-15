@@ -17,13 +17,13 @@ import java.util.*
 @RestController
 class APIController(@Autowired meterRegistry: MeterRegistry) {
 
-    private val rateLimitPerSec = 1100
+    private val rateLimitPerSec = 4500
     private val processingTimeSec = 50
     val logger: Logger = LoggerFactory.getLogger(APIController::class.java)
     private val rateLimiter = LeakingBucketRateLimiter(
         rateLimitPerSec.toLong(),
         Duration.ofSeconds(1),
-        rateLimitPerSec * (processingTimeSec - 1)
+        rateLimitPerSec
     )
 
     private val orderCounter: Counter = Counter.builder("http_requests_served")
@@ -73,7 +73,7 @@ class APIController(@Autowired meterRegistry: MeterRegistry) {
     }
 
     @PostMapping("/orders/{orderId}/payment")
-    fun payOrder(@PathVariable orderId: UUID, @RequestParam deadline: Long): ResponseEntity<PaymentSubmissionDto> {
+    suspend fun payOrder(@PathVariable orderId: UUID, @RequestParam deadline: Long): ResponseEntity<PaymentSubmissionDto> {
         val paymentId = UUID.randomUUID()
         val order = orderRepository.findById(orderId)?.let {
             orderRepository.save(it.copy(status = OrderStatus.PAYMENT_IN_PROGRESS))
@@ -84,6 +84,7 @@ class APIController(@Autowired meterRegistry: MeterRegistry) {
             val createdAt = orderPayer.processPayment(orderId, order.price, paymentId, deadline)
             return ResponseEntity.ok(PaymentSubmissionDto(createdAt, paymentId))
         } catch(_: Exception) {
+            logger.warn("Payment request rejected for order $orderId")
             return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS)
                 .header("Retry-After", "1")
                 .build()
