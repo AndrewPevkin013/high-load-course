@@ -6,7 +6,6 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.future.await
 import kotlinx.coroutines.sync.Semaphore
-import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import org.slf4j.LoggerFactory
 import ru.quipy.common.utils.SlidingWindowRateLimiter
@@ -27,7 +26,8 @@ class PaymentExternalSystemAdapterImpl(
     private val paymentESService: EventSourcingService<UUID, PaymentAggregate, PaymentAggregateState>,
     private val paymentProviderHostPort: String,
     private val token: String,
-    private val dbScope: CoroutineScope
+    @Suppress("UNUSED_PARAMETER")
+    dbScope: CoroutineScope
 ) : PaymentExternalSystemAdapter {
 
     companion object {
@@ -39,10 +39,9 @@ class PaymentExternalSystemAdapterImpl(
     private val accountName = properties.accountName
     private val parallelRequests = properties.parallelRequests
     private val rateLimitPerSec = properties.rateLimitPerSec
-    private val requestAverageProcessingTime = properties.averageProcessingTime
 
     private val client = HttpClient.newBuilder()
-        .executor(Executors.newFixedThreadPool(50))
+        .executor(Executors.newFixedThreadPool(100))
         .version(HttpClient.Version.HTTP_2)
         .connectTimeout(Duration.ofMillis(50))
         .build()
@@ -51,24 +50,27 @@ class PaymentExternalSystemAdapterImpl(
     private val semaphore = Semaphore(parallelRequests)
 
     private val retryCount = 2
-    private val baseDelay = requestAverageProcessingTime.toMillis().coerceAtLeast(10)
     private val maxDelay = 50L
+    private val baseDelay = 10L
 
     override suspend fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         logger.info("[$accountName] Submitting payment request for payment $paymentId")
 
+        if (now() >= deadline) {
+            logger.error("[$accountName] Deadline already exceeded before submission for payment $paymentId")
+            return
+        }
+
         val transactionId = UUID.randomUUID()
         val submittedAt = now()
 
-        withContext(dbScope.coroutineContext) {
-            paymentESService.update(paymentId) {
-                it.logSubmission(
-                    success = true,
-                    transactionId = transactionId,
-                    startedAt = submittedAt,
-                    spentInQueueDuration = Duration.ofMillis(submittedAt - paymentStartedAt)
-                )
-            }
+        paymentESService.update(paymentId) {
+            it.logSubmission(
+                success = true,
+                transactionId = transactionId,
+                startedAt = submittedAt,
+                spentInQueueDuration = Duration.ofMillis(submittedAt - paymentStartedAt)
+            )
         }
 
         logger.info("[$accountName] Submit: $paymentId, txId: $transactionId")
@@ -90,7 +92,9 @@ class PaymentExternalSystemAdapterImpl(
 
             if (!waitForRateLimit(deadline)) {
                 logger.error("[$accountName] Rate limit timeout for payment $paymentId")
-                logProcessing(paymentId, transactionId, false, "Rate limit timeout")
+                paymentESService.update(paymentId) {
+                    it.logProcessing(false, now(), transactionId, reason = "Rate limit timeout")
+                }
                 return
             }
 
@@ -106,7 +110,9 @@ class PaymentExternalSystemAdapterImpl(
 
             if (!acquired) {
                 logger.error("[$accountName] Semaphore timeout for payment $paymentId")
-                logProcessing(paymentId, transactionId, false, "Semaphore timeout")
+                paymentESService.update(paymentId) {
+                    it.logProcessing(false, now(), transactionId, reason = "Semaphore timeout")
+                }
                 return
             }
 
@@ -117,7 +123,9 @@ class PaymentExternalSystemAdapterImpl(
                     logger.error("[$accountName] Payment timeout for payment $paymentId (attempt $attempt)")
 
                     if (attempt >= retryCount || now() >= deadline) {
-                        logProcessing(paymentId, transactionId, false, "Request timeout")
+                        paymentESService.update(paymentId) {
+                            it.logProcessing(false, now(), transactionId, reason = "Request timeout")
+                        }
                         processed = true
                     } else {
                         delay(exponentialBackoffDelay(attempt))
@@ -126,37 +134,49 @@ class PaymentExternalSystemAdapterImpl(
                     continue
                 }
 
-                logger.info("[$accountName] Payment result for txId: $transactionId, succeeded: ${response.result}")
+                logger.info(
+                    "[$accountName] Payment result for txId: $transactionId, " +
+                            "succeeded: ${response.result}, message: ${response.message}"
+                )
 
                 if (response.result) {
-                    logProcessing(paymentId, transactionId, true, response.message)
+                    paymentESService.update(paymentId) {
+                        it.logProcessing(true, now(), transactionId, reason = response.message)
+                    }
                     processed = true
-                } else if (response.message == "Temporary error" && attempt < retryCount && now() < deadline) {
+                } else if (
+                    response.message == "Temporary error" &&
+                    attempt < retryCount &&
+                    now() < deadline
+                ) {
                     delay(exponentialBackoffDelay(attempt))
                 } else {
-                    logProcessing(paymentId, transactionId, false, response.message)
+                    paymentESService.update(paymentId) {
+                        it.logProcessing(false, now(), transactionId, reason = response.message)
+                    }
                     processed = true
                 }
 
             } catch (e: Exception) {
                 when (e.cause) {
-                    is SocketTimeoutException -> {
+                    is SocketTimeoutException ->
                         logger.error("[$accountName] Socket timeout for payment $paymentId", e)
-                    }
-                    else -> {
+
+                    else ->
                         logger.error("[$accountName] Error processing payment $paymentId (attempt $attempt)", e)
-                    }
                 }
 
                 if (attempt < retryCount && now() < deadline) {
                     delay(exponentialBackoffDelay(attempt))
                 } else {
-                    logProcessing(
-                        paymentId,
-                        transactionId,
-                        false,
-                        "Failed after $attempt attempts: ${e.message}"
-                    )
+                    paymentESService.update(paymentId) {
+                        it.logProcessing(
+                            false,
+                            now(),
+                            transactionId,
+                            reason = "Failed after $attempt attempts: ${e.message}"
+                        )
+                    }
                     processed = true
                 }
             } finally {
@@ -166,7 +186,9 @@ class PaymentExternalSystemAdapterImpl(
 
         if (!processed) {
             logger.error("[$accountName] Deadline exceeded for payment $paymentId")
-            logProcessing(paymentId, transactionId, false, "Deadline exceeded")
+            paymentESService.update(paymentId) {
+                it.logProcessing(false, now(), transactionId, reason = "Deadline exceeded")
+            }
         }
     }
 
@@ -175,7 +197,7 @@ class PaymentExternalSystemAdapterImpl(
             if (now() >= deadline) {
                 return false
             }
-            delay(2)
+            delay(1)
         }
         return true
     }
@@ -187,7 +209,7 @@ class PaymentExternalSystemAdapterImpl(
         deadline: Long
     ): ExternalSysResponse? {
         val remainingTime = deadline - now()
-        if (remainingTime <= 50) {
+        if (remainingTime <= 20) {
             return null
         }
 
@@ -217,24 +239,8 @@ class PaymentExternalSystemAdapterImpl(
         }
     }
 
-    private suspend fun logProcessing(
-        paymentId: UUID,
-        transactionId: UUID,
-        success: Boolean,
-        reason: String?
-    ) {
-        withContext(dbScope.coroutineContext) {
-            paymentESService.update(paymentId) {
-                it.logProcessing(success, now(), transactionId, reason = reason)
-            }
-        }
-    }
-
     private fun exponentialBackoffDelay(attempt: Int): Long {
-        return minOf(
-            (baseDelay * 2.0.pow((attempt - 1).toDouble())).toLong(),
-            maxDelay
-        )
+        return minOf((baseDelay * 2.0.pow((attempt - 1).toDouble())).toLong(), maxDelay)
     }
 
     override fun price() = properties.price
