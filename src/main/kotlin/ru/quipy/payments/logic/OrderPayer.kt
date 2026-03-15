@@ -4,7 +4,6 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Autowired
@@ -50,7 +49,7 @@ class OrderPayer(private val dbScope: CoroutineScope) {
                 return@launch
             }
 
-            withContext(dbScope.coroutineContext) {
+            dbScope.launch {
                 paymentESService.create {
                     it.create(paymentId, orderId, amount)
                 }
