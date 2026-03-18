@@ -24,6 +24,7 @@ import java.util.concurrent.Executors
 import kotlin.math.pow
 
 
+// Advice: always treat time as a Duration
 class PaymentExternalSystemAdapterImpl(
     private val properties: PaymentAccountProperties,
     private val paymentESService: EventSourcingService<UUID, PaymentAggregate, PaymentAggregateState>,
@@ -52,11 +53,17 @@ class PaymentExternalSystemAdapterImpl(
     private val semaphore = Semaphore(parallelRequests)
 
 
-    private suspend fun waitRateLimitOrTimeout(deadline: Long): Boolean {
+    private suspend fun waitTimeout(deadline: Long): Boolean {
+
         while (!rateLimiter.tick()) {
-            if (now() >= deadline) return false
+
+            if (now() >= deadline) {
+                return false
+            }
+
             delay(2)
         }
+
         return true
     }
 
@@ -65,6 +72,7 @@ class PaymentExternalSystemAdapterImpl(
     private val baseDelay = 200L
 
     override suspend fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
+
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
         val transactionId = UUID.randomUUID()
 
@@ -77,7 +85,7 @@ class PaymentExternalSystemAdapterImpl(
 
         logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
 
-        if (!waitRateLimitOrTimeout(deadline)) {
+        if (!waitTimeout(deadline)) {
             logger.error("[$accountName] Rate limit wait exceeded deadline for txId: $transactionId, payment: $paymentId")
             dbScope.launch {
                 paymentESService.update(paymentId) {
@@ -93,10 +101,10 @@ class PaymentExternalSystemAdapterImpl(
             .build()
 
         var attempt = 0
-        var processed = false
+        var isProccesed = false
 
         semaphore.withPermit {
-            while (!processed && attempt < retryCount && now() < deadline) {
+            while (!isProccesed && attempt < retryCount && now() < deadline) {
                 attempt++
 
                 try {
@@ -115,7 +123,7 @@ class PaymentExternalSystemAdapterImpl(
                                     it.logProcessing(false, now(), transactionId, reason = "Request timeout.")
                                 }
                             }
-                            processed = true
+                            isProccesed = true
                         }
                         continue
                     }
@@ -136,16 +144,16 @@ class PaymentExternalSystemAdapterImpl(
                                 it.logProcessing(true, now(), transactionId, reason = body.message)
                             }
                         }
-                        processed = true
+                        isProccesed = true
                     } else if (body.message == "Temporary error" && attempt < retryCount && now() < deadline) {
-                        delay(exponentialBackoffDelay(attempt))
+                        delay(calculateDelay(attempt))
                     } else {
                         dbScope.launch {
                             paymentESService.update(paymentId) {
                                 it.logProcessing(false, now(), transactionId, reason = body.message)
                             }
                         }
-                        processed = true
+                        isProccesed = true
                     }
 
                 } catch (e: Exception) {
@@ -158,11 +166,11 @@ class PaymentExternalSystemAdapterImpl(
                             it.logProcessing(false, now(), transactionId, reason = e.message)
                         }
                     }
-                    processed = true
+                    isProccesed = true
                 }
             }
 
-            if (!processed) {
+            if (!isProccesed) {
                 dbScope.launch {
                     paymentESService.update(paymentId) {
                         it.logProcessing(false, now(), transactionId, reason = "Deadline exceeded.")
@@ -174,7 +182,8 @@ class PaymentExternalSystemAdapterImpl(
     override fun price() = properties.price
     override fun isEnabled() = properties.enabled
     override fun name() = properties.accountName
-    private fun exponentialBackoffDelay(attempt: Int): Long {
+
+    private fun calculateDelay(attempt: Int): Long {
         return minOf((baseDelay * 2.0.pow((attempt - 1).toDouble())).toLong(), maxDelay)
     }
 }
