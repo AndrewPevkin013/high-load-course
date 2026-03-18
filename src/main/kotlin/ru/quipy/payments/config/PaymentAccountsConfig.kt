@@ -3,10 +3,16 @@ package ru.quipy.payments.config
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
+import io.micrometer.core.instrument.MeterRegistry
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.asCoroutineDispatcher
 import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.beans.factory.annotation.Value
 import org.springframework.context.annotation.Bean
 import org.springframework.context.annotation.Configuration
+import ru.quipy.common.utils.NamedThreadFactory
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
 import ru.quipy.payments.logic.*
@@ -15,6 +21,9 @@ import java.net.http.HttpClient
 import java.net.http.HttpRequest
 import java.net.http.HttpResponse
 import java.util.*
+import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.ThreadPoolExecutor
+import java.util.concurrent.TimeUnit
 
 
 @Configuration
@@ -22,7 +31,21 @@ class PaymentAccountsConfig {
     companion object {
         private val javaClient = HttpClient.newBuilder().build()
         private val mapper = ObjectMapper().registerKotlinModule().registerModules(JavaTimeModule())
+
+        private val dbExecutor = ThreadPoolExecutor(
+            120, 120, 60L, TimeUnit.SECONDS,
+            LinkedBlockingQueue(20_000),
+            NamedThreadFactory("payment-db-executor"),
+            ThreadPoolExecutor.DiscardOldestPolicy()
+        )
+
+        private val dbScope = CoroutineScope(
+            SupervisorJob() + Dispatchers.IO + dbExecutor.asCoroutineDispatcher()
+        )
     }
+
+    @Bean
+    fun dbScope() = dbScope
 
     @Value("\${payment.hostPort}")
     lateinit var paymentProviderHostPort: String
@@ -35,9 +58,6 @@ class PaymentAccountsConfig {
 
     @Value("#{'\${payment.accounts}'.split(',')}")
     lateinit var allowedAccounts: List<String>
-
-    @Autowired
-    private lateinit var metricsReporter: MetricsReporter
 
     @Bean
     fun accountAdapters(paymentService: EventSourcingService<UUID, PaymentAggregate, PaymentAggregateState>): List<PaymentExternalSystemAdapter> {
@@ -62,7 +82,7 @@ class PaymentAccountsConfig {
                     paymentService,
                     paymentProviderHostPort,
                     token,
-                    metricsReporter
+                    dbScope
                 )
             }
     }
