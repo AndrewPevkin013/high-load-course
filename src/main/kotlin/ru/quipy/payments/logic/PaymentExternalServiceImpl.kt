@@ -2,9 +2,6 @@ package ru.quipy.payments.logic
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
-import io.micrometer.core.instrument.Counter
-import io.micrometer.core.instrument.DistributionSummary
-import io.micrometer.core.instrument.MeterRegistry
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -37,11 +34,11 @@ class PaymentExternalSystemAdapterImpl(
     private val paymentESService: EventSourcingService<UUID, PaymentAggregate, PaymentAggregateState>,
     private val paymentProviderHostPort: String,
     private val token: String,
-    private val dbScope: CoroutineScope,
+    private val dbScope: CoroutineScope
 ) : PaymentExternalSystemAdapter {
 
     companion object {
-        val logger = LoggerFactory.getLogger(PaymentExternalSystemAdapterImpl::class.java)
+        val logger = LoggerFactory.getLogger(PaymentExternalSystemAdapter::class.java)
         val emptyBody = RequestBody.create(null, ByteArray(0))
         val mapper = ObjectMapper().registerKotlinModule()
     }
@@ -60,7 +57,7 @@ class PaymentExternalSystemAdapterImpl(
         .build()
 
     private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), Duration.ofSeconds(1))
-    private val inFlightRequestsWindow = OngoingWindow(parallelRequests)
+    private val ongoingWindow = OngoingWindow(parallelRequests)
 
 
     private val retryCount = 3
@@ -114,7 +111,7 @@ class PaymentExternalSystemAdapterImpl(
             return
         }
 
-        if (!inFlightRequestsWindow.tryAcquire(deadline - now(), TimeUnit.MILLISECONDS)) {
+        if (!ongoingWindow.tryAcquire(deadline - now(), TimeUnit.MILLISECONDS)) {
             logger.error("[$accountName] In-flight window timeout for txId: $transactionId, payment: $paymentId")
             dbScope.launch {
                 paymentESService.update(paymentId) {
@@ -238,7 +235,7 @@ class PaymentExternalSystemAdapterImpl(
                 }
             }
         } finally {
-            inFlightRequestsWindow.release()
+            ongoingWindow.release()
         }
     }
 
