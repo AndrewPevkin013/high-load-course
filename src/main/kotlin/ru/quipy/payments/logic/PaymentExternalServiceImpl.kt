@@ -58,13 +58,13 @@ class PaymentExternalSystemAdapterImpl(
     private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), Duration.ofSeconds(1))
     private val semaphore = Semaphore(parallelRequests, true)
 
-    private val retryCount = 4
-    private val maxDelay = 300L
-    private val baseDelay = 75L
+    private val retryCount = 3
+    private val maxDelay = 250L
+    private val baseDelay = 100L
 
-    private val hedgeCopies = 3
-    private val hedgeSpacingMs = 60L
-    private val attemptTimeoutMs = 350L
+    private val hedgeCopies = 2
+    private val hedgeSpacingMs = 1000L
+    private val requestTimeoutMs = 1700L
 
     private suspend fun waitTimeout(deadline: Long): Boolean {
         while (!rateLimiter.tick()) {
@@ -141,7 +141,7 @@ class PaymentExternalSystemAdapterImpl(
                 )
             )
             .header("x-idempotency-key", idempotencyKey)
-            .timeout(Duration.ofMillis(attemptTimeoutMs))
+            .timeout(Duration.ofMillis(requestTimeoutMs))
             .POST(HttpRequest.BodyPublishers.noBody())
             .build()
 
@@ -274,7 +274,7 @@ class PaymentExternalSystemAdapterImpl(
                     return@async
                 }
 
-                val requestBudget = minOf(timeLeft, attemptTimeoutMs)
+                val requestBudget = minOf(timeLeft, requestTimeoutMs)
 
                 try {
                     val response = withTimeoutOrNull(requestBudget) {
