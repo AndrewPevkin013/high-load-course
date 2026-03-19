@@ -38,7 +38,6 @@ class PaymentExternalSystemAdapterImpl(
     private val paymentProviderHostPort: String,
     private val token: String,
     private val dbScope: CoroutineScope,
-    meterRegistry: MeterRegistry
 ) : PaymentExternalSystemAdapter {
 
     companion object {
@@ -63,14 +62,6 @@ class PaymentExternalSystemAdapterImpl(
     private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), Duration.ofSeconds(1))
     private val inFlightRequestsWindow = OngoingWindow(parallelRequests)
 
-    private val submittedPaymentsCounter = Counter.builder("payments_submitted_total").register(meterRegistry)
-    private val processedPaymentsCounter = Counter.builder("payments_success").register(meterRegistry)
-    private val backupRequestsCounter = Counter.builder("payments_hedge_total").register(meterRegistry)
-
-    private val externalCallLatency = DistributionSummary.builder("request_latency")
-        .description("External payment request latency.")
-        .publishPercentiles(0.5, 0.8, 0.90, 0.95, 0.99)
-        .register(meterRegistry)
 
     private val retryCount = 3
     private val maxRetryDelayMs = 1000L
@@ -97,7 +88,6 @@ class PaymentExternalSystemAdapterImpl(
         deadline: Long
     ) {
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
-        submittedPaymentsCounter.increment()
 
         val transactionId = UUID.randomUUID()
         val idempotencyKey = transactionId.toString()
@@ -187,8 +177,6 @@ class PaymentExternalSystemAdapterImpl(
                         continue
                     }
 
-                    externalCallLatency.record((System.currentTimeMillis() - requestStartedAt).toDouble())
-
                     val body = try {
                         mapper.readValue(response.body(), ExternalSysResponse::class.java)
                     } catch (e: Exception) {
@@ -203,7 +191,7 @@ class PaymentExternalSystemAdapterImpl(
                     )
 
                     if (body.result) {
-                        processedPaymentsCounter.increment()
+
                         dbScope.launch {
                             paymentESService.update(paymentId) {
                                 it.logProcessing(true, now(), transactionId, reason = body.message)
@@ -271,9 +259,6 @@ class PaymentExternalSystemAdapterImpl(
                 }
 
                 try {
-                    if (copyIndex > 0) {
-                        backupRequestsCounter.increment()
-                    }
 
                     val response = withTimeout(timeoutBudgetMs) {
                         client.sendAsync(request, HttpResponse.BodyHandlers.ofString()).await()
