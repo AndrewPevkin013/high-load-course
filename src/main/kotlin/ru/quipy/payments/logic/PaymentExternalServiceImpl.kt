@@ -2,16 +2,22 @@ package ru.quipy.payments.logic
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
+import io.micrometer.core.instrument.Counter
+import io.micrometer.core.instrument.DistributionSummary
+import io.micrometer.core.instrument.MeterRegistry
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.future.await
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.RequestBody
 import org.slf4j.LoggerFactory
+import ru.quipy.common.utils.OngoingWindow
 import ru.quipy.common.utils.SlidingWindowRateLimiter
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
@@ -23,9 +29,7 @@ import java.net.http.HttpResponse
 import java.time.Duration
 import java.util.UUID
 import java.util.concurrent.Executors
-import java.util.concurrent.Semaphore
 import java.util.concurrent.TimeUnit
-import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.pow
 
 class PaymentExternalSystemAdapterImpl(
@@ -33,7 +37,8 @@ class PaymentExternalSystemAdapterImpl(
     private val paymentESService: EventSourcingService<UUID, PaymentAggregate, PaymentAggregateState>,
     private val paymentProviderHostPort: String,
     private val token: String,
-    private val dbScope: CoroutineScope
+    private val dbScope: CoroutineScope,
+    meterRegistry: MeterRegistry
 ) : PaymentExternalSystemAdapter {
 
     companion object {
@@ -56,32 +61,33 @@ class PaymentExternalSystemAdapterImpl(
         .build()
 
     private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), Duration.ofSeconds(1))
-    private val semaphore = Semaphore(parallelRequests, true)
+    private val inFlightRequestsWindow = OngoingWindow(parallelRequests)
+
+    private val submittedPaymentsCounter = Counter.builder("payments_submitted_total").register(meterRegistry)
+    private val processedPaymentsCounter = Counter.builder("payments_success").register(meterRegistry)
+    private val backupRequestsCounter = Counter.builder("payments_hedge_total").register(meterRegistry)
+
+    private val externalCallLatency = DistributionSummary.builder("request_latency")
+        .description("External payment request latency.")
+        .publishPercentiles(0.5, 0.8, 0.90, 0.95, 0.99)
+        .register(meterRegistry)
 
     private val retryCount = 3
-    private val maxDelay = 250L
-    private val baseDelay = 100L
+    private val maxRetryDelayMs = 1000L
+    private val baseRetryDelayMs = 200L
 
-    private val hedgeCopies = 2
-    private val hedgeSpacingMs = 1000L
-    private val requestTimeoutMs = 1700L
+    private val backupRequestCopies = 3
+    private val backupRequestDelayMs = 100L
+    private val requestTimeoutMs = 1500L
 
-    private suspend fun waitTimeout(deadline: Long): Boolean {
+    private suspend fun waitForRateSlotUntil(deadline: Long): Boolean {
         while (!rateLimiter.tick()) {
             if (now() >= deadline) {
                 return false
             }
-            delay(2)
+            delay(5)
         }
         return true
-    }
-
-    private fun tryAcquireSlot(deadline: Long): Boolean {
-        val waitMs = deadline - now()
-        if (waitMs <= 0) {
-            return false
-        }
-        return semaphore.tryAcquire(waitMs, TimeUnit.MILLISECONDS)
     }
 
     override suspend fun performPaymentAsync(
@@ -91,6 +97,8 @@ class PaymentExternalSystemAdapterImpl(
         deadline: Long
     ) {
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
+        submittedPaymentsCounter.increment()
+
         val transactionId = UUID.randomUUID()
         val idempotencyKey = transactionId.toString()
 
@@ -99,16 +107,14 @@ class PaymentExternalSystemAdapterImpl(
             paymentESService.update(paymentId) {
                 it.logSubmission(
                     success = true,
-                    transactionId,
-                    submittedAt,
+                    transactionId = transactionId,
+                     submittedAt,
                     Duration.ofMillis(submittedAt - paymentStartedAt)
                 )
             }
         }
 
-        logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
-
-        if (!waitTimeout(deadline)) {
+        if (!waitForRateSlotUntil(deadline)) {
             logger.error("[$accountName] Rate limit wait exceeded deadline for txId: $transactionId, payment: $paymentId")
             dbScope.launch {
                 paymentESService.update(paymentId) {
@@ -118,15 +124,17 @@ class PaymentExternalSystemAdapterImpl(
             return
         }
 
-        if (!tryAcquireSlot(deadline)) {
-            logger.error("[$accountName] Parallel slot wait exceeded deadline for txId: $transactionId, payment: $paymentId")
+        if (!inFlightRequestsWindow.tryAcquire(deadline - now(), TimeUnit.MILLISECONDS)) {
+            logger.error("[$accountName] In-flight window timeout for txId: $transactionId, payment: $paymentId")
             dbScope.launch {
                 paymentESService.update(paymentId) {
-                    it.logProcessing(false, now(), transactionId, reason = "Parallel slot wait exceeded deadline.")
+                    it.logProcessing(false, now(), transactionId, reason = "In-flight window timeout.")
                 }
             }
             return
         }
+
+        logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
 
         val request = HttpRequest.newBuilder()
             .uri(
@@ -145,36 +153,41 @@ class PaymentExternalSystemAdapterImpl(
             .POST(HttpRequest.BodyPublishers.noBody())
             .build()
 
-        var attempt = 0
-        var isProcessed = false
+        var attemptNumber = 0
+        var finished = false
 
         try {
-            while (!isProcessed && attempt < retryCount && now() < deadline) {
-                attempt++
+            while (!finished && attemptNumber < retryCount && now() < deadline) {
+                attemptNumber++
 
                 try {
-                    val remainingTime = deadline - now()
-                    if (remainingTime <= 0) {
+                    val timeLeft = deadline - now()
+                    if (timeLeft <= 0) {
                         break
                     }
 
-                    val response = sendWithHedging(
+                    val requestStartedAt = System.currentTimeMillis()
+                    val response = raceForFirstResponse(
                         request = request,
-                        deadline = deadline
+                        copies = backupRequestCopies,
+                        delayBetweenCopiesMs = backupRequestDelayMs,
+                        timeoutBudgetMs = timeLeft
                     )
 
                     if (response == null) {
-                        logger.error("[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId, attempt: $attempt")
-                        if (attempt >= retryCount || now() >= deadline) {
+                        logger.error("[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId, attempt: $attemptNumber")
+                        if (attemptNumber >= retryCount || now() >= deadline) {
                             dbScope.launch {
                                 paymentESService.update(paymentId) {
                                     it.logProcessing(false, now(), transactionId, reason = "Request timeout.")
                                 }
                             }
-                            isProcessed = true
+                            finished = true
                         }
                         continue
                     }
+
+                    externalCallLatency.record((System.currentTimeMillis() - requestStartedAt).toDouble())
 
                     val body = try {
                         mapper.readValue(response.body(), ExternalSysResponse::class.java)
@@ -182,12 +195,7 @@ class PaymentExternalSystemAdapterImpl(
                         logger.error(
                             "[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.statusCode()}, reason: ${response.body()}"
                         )
-                        ExternalSysResponse(
-                            transactionId.toString(),
-                            paymentId.toString(),
-                            false,
-                            e.message
-                        )
+                        ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
                     }
 
                     logger.warn(
@@ -195,21 +203,22 @@ class PaymentExternalSystemAdapterImpl(
                     )
 
                     if (body.result) {
+                        processedPaymentsCounter.increment()
                         dbScope.launch {
                             paymentESService.update(paymentId) {
                                 it.logProcessing(true, now(), transactionId, reason = body.message)
                             }
                         }
-                        isProcessed = true
-                    } else if (body.message == "Temporary error" && attempt < retryCount && now() < deadline) {
-                        delay(calculateDelay(attempt))
+                        finished = true
+                    } else if (body.message == "Temporary error" && attemptNumber < retryCount && now() < deadline) {
+                        delay(calculateRetryDelay(attemptNumber))
                     } else {
                         dbScope.launch {
                             paymentESService.update(paymentId) {
                                 it.logProcessing(false, now(), transactionId, reason = body.message)
                             }
                         }
-                        isProcessed = true
+                        finished = true
                     }
                 } catch (e: Exception) {
                     when (e.cause) {
@@ -229,11 +238,11 @@ class PaymentExternalSystemAdapterImpl(
                             it.logProcessing(false, now(), transactionId, reason = e.message)
                         }
                     }
-                    isProcessed = true
+                    finished = true
                 }
             }
 
-            if (!isProcessed) {
+            if (!finished) {
                 dbScope.launch {
                     paymentESService.update(paymentId) {
                         it.logProcessing(false, now(), transactionId, reason = "Deadline exceeded.")
@@ -241,69 +250,50 @@ class PaymentExternalSystemAdapterImpl(
                 }
             }
         } finally {
-            semaphore.release()
+            inFlightRequestsWindow.release()
         }
     }
 
-    private suspend fun sendWithHedging(
+    private suspend fun raceForFirstResponse(
         request: HttpRequest,
-        deadline: Long
+        copies: Int,
+        delayBetweenCopiesMs: Long,
+        timeoutBudgetMs: Long
     ): HttpResponse<String>? = coroutineScope {
-        val winner = CompletableDeferred<HttpResponse<String>?>()
-        val finishedCount = AtomicInteger(0)
+        val firstCompletedResponse = CompletableDeferred<HttpResponse<String>?>()
 
-        fun completeIfAllFailed() {
-            if (finishedCount.incrementAndGet() == hedgeCopies && !winner.isCompleted) {
-                winner.complete(null)
-            }
-        }
+        val workers = (0 until copies).map { copyIndex ->
+            async(Dispatchers.IO) {
+                delay(copyIndex * delayBetweenCopiesMs)
 
-        val jobs = List(hedgeCopies) { copyIndex ->
-            async {
-                if (copyIndex > 0) {
-                    delay(copyIndex * hedgeSpacingMs)
-                }
-
-                if (winner.isCompleted) {
+                if (firstCompletedResponse.isCompleted) {
                     return@async
                 }
-
-                val timeLeft = deadline - now()
-                if (timeLeft <= 0) {
-                    completeIfAllFailed()
-                    return@async
-                }
-
-                val requestBudget = minOf(timeLeft, requestTimeoutMs)
 
                 try {
-                    val response = withTimeoutOrNull(requestBudget) {
+                    if (copyIndex > 0) {
+                        backupRequestsCounter.increment()
+                    }
+
+                    val response = withTimeout(timeoutBudgetMs) {
                         client.sendAsync(request, HttpResponse.BodyHandlers.ofString()).await()
                     }
 
-                    if (response != null) {
-                        winner.complete(response)
-                    } else {
-                        completeIfAllFailed()
-                    }
+                    firstCompletedResponse.complete(response)
                 } catch (_: Exception) {
-                    completeIfAllFailed()
+                    if (copyIndex == copies - 1 && !firstCompletedResponse.isCompleted) {
+                        firstCompletedResponse.complete(null)
+                    }
                 }
             }
         }
 
-        try {
-            val totalTimeLeft = deadline - now()
-            if (totalTimeLeft <= 0) {
-                null
-            } else {
-                withTimeoutOrNull(totalTimeLeft) {
-                    winner.await()
-                }
-            }
-        } finally {
-            jobs.forEach { it.cancel() }
+        val result = withTimeoutOrNull(timeoutBudgetMs) {
+            firstCompletedResponse.await()
         }
+
+        workers.forEach { it.cancel() }
+        result
     }
 
     override fun price() = properties.price
@@ -312,8 +302,11 @@ class PaymentExternalSystemAdapterImpl(
 
     override fun name() = properties.accountName
 
-    private fun calculateDelay(attempt: Int): Long {
-        return minOf((baseDelay * 2.0.pow((attempt - 1).toDouble())).toLong(), maxDelay)
+    private fun calculateRetryDelay(attempt: Int): Long {
+        return minOf(
+            (baseRetryDelayMs * 2.0.pow((attempt - 1).toDouble())).toLong(),
+            maxRetryDelayMs
+        )
     }
 }
 
