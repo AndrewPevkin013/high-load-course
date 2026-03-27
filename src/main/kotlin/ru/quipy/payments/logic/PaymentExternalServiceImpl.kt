@@ -177,12 +177,19 @@ class PaymentExternalSystemAdapterImpl(
                     }
 
                     val startedAt = System.currentTimeMillis()
-                    val response = raceForFirstResponse(
-                        request = request,
-                        copies = backupRequestCopies,
-                        delayBetweenCopiesMs = backupRequestDelayMs,
-                        timeoutBudgetMs = timeLeft
-                    )
+                    val response = try {
+                        withTimeout(timeLeft.coerceAtMost(requestTimeoutMs)) {
+                            client.sendAsync(request, HttpResponse.BodyHandlers.ofString()).await()
+                        }
+                    } catch (e: Exception) {
+                        null
+                    }
+//                    val response = raceForFirstResponse(
+//                        request = request,
+//                        copies = backupRequestCopies,
+//                        delayBetweenCopiesMs = backupRequestDelayMs,
+//                        timeoutBudgetMs = timeLeft
+//                    )
                     val latencyMs = System.currentTimeMillis() - startedAt
 
                     if (response == null) {
