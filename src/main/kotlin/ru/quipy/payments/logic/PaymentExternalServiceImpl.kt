@@ -2,6 +2,8 @@ package ru.quipy.payments.logic
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
+import io.github.resilience4j.circuitbreaker.CircuitBreaker
+import io.github.resilience4j.circuitbreaker.CircuitBreakerConfig
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -59,7 +61,6 @@ class PaymentExternalSystemAdapterImpl(
     private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), Duration.ofSeconds(1))
     private val ongoingWindow = OngoingWindow(parallelRequests)
 
-
     private val retryCount = 3
     private val maxRetryDelayMs = 1000L
     private val baseRetryDelayMs = 200L
@@ -67,6 +68,17 @@ class PaymentExternalSystemAdapterImpl(
     private val backupRequestCopies = 3
     private val backupRequestDelayMs = 100L
     private val requestTimeoutMs = 1500L
+
+    private val circuitBreakerConfig = CircuitBreakerConfig.custom()
+        .failureRateThreshold(10F)
+        .slowCallRateThreshold(10F)
+        .waitDurationInOpenState(Duration.ofSeconds(10))
+        .slowCallDurationThreshold(Duration.ofSeconds(1))
+        .permittedNumberOfCallsInHalfOpenState(50)
+        .build()
+
+    private val circuitBreaker = CircuitBreaker.of("paymentService", circuitBreakerConfig)
+
 
     private suspend fun waitForRateSlotUntil(deadline: Long): Boolean {
         while (!rateLimiter.tick()) {
@@ -95,7 +107,7 @@ class PaymentExternalSystemAdapterImpl(
                 it.logSubmission(
                     success = true,
                     transactionId = transactionId,
-                     submittedAt,
+                    submittedAt,
                     Duration.ofMillis(submittedAt - paymentStartedAt)
                 )
             }
@@ -112,10 +124,21 @@ class PaymentExternalSystemAdapterImpl(
         }
 
         if (!ongoingWindow.tryAcquire(deadline - now(), TimeUnit.MILLISECONDS)) {
-            logger.error("[$accountName] In-flight window timeout for txId: $transactionId, payment: $paymentId")
+            logger.error("[$accountName] Ongoing window timeout for txId: $transactionId, payment: $paymentId")
             dbScope.launch {
                 paymentESService.update(paymentId) {
-                    it.logProcessing(false, now(), transactionId, reason = "In-flight window timeout.")
+                    it.logProcessing(false, now(), transactionId, reason = "Ongoing window timeout.")
+                }
+            }
+            return
+        }
+
+        if (!circuitBreaker.tryAcquirePermission()) {
+            logger.error("[$accountName] Circuit breaker is open for txId: $transactionId")
+            ongoingWindow.release()
+            dbScope.launch {
+                paymentESService.update(paymentId) {
+                    it.logProcessing(false, now(), transactionId, reason = "Circuit breaker opened")
                 }
             }
             return
@@ -153,16 +176,19 @@ class PaymentExternalSystemAdapterImpl(
                         break
                     }
 
-                    val requestStartedAt = System.currentTimeMillis()
+                    val startedAt = System.currentTimeMillis()
                     val response = raceForFirstResponse(
                         request = request,
                         copies = backupRequestCopies,
                         delayBetweenCopiesMs = backupRequestDelayMs,
                         timeoutBudgetMs = timeLeft
                     )
+                    val latencyMs = System.currentTimeMillis() - startedAt
 
                     if (response == null) {
                         logger.error("[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId, attempt: $attemptNumber")
+                        circuitBreaker.onError(latencyMs, TimeUnit.MILLISECONDS, Exception("Request timeout"))
+
                         if (attemptNumber >= retryCount || now() >= deadline) {
                             dbScope.launch {
                                 paymentESService.update(paymentId) {
@@ -180,7 +206,12 @@ class PaymentExternalSystemAdapterImpl(
                         logger.error(
                             "[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.statusCode()}, reason: ${response.body()}"
                         )
-                        ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
+                        ExternalSysResponse(
+                            transactionId = transactionId.toString(),
+                            paymentId = paymentId.toString(),
+                            result = false,
+                            message = e.message
+                        )
                     }
 
                     logger.warn(
@@ -188,6 +219,7 @@ class PaymentExternalSystemAdapterImpl(
                     )
 
                     if (body.result) {
+                        circuitBreaker.onSuccess(latencyMs, TimeUnit.MILLISECONDS)
 
                         dbScope.launch {
                             paymentESService.update(paymentId) {
@@ -196,8 +228,11 @@ class PaymentExternalSystemAdapterImpl(
                         }
                         finished = true
                     } else if (body.message == "Temporary error" && attemptNumber < retryCount && now() < deadline) {
+                        circuitBreaker.onError(latencyMs, TimeUnit.MILLISECONDS, Exception(body.message))
                         delay(calculateRetryDelay(attemptNumber))
                     } else {
+                        circuitBreaker.onError(latencyMs, TimeUnit.MILLISECONDS, Exception(body.message))
+
                         dbScope.launch {
                             paymentESService.update(paymentId) {
                                 it.logProcessing(false, now(), transactionId, reason = body.message)
@@ -206,12 +241,13 @@ class PaymentExternalSystemAdapterImpl(
                         finished = true
                     }
                 } catch (e: Exception) {
+                    circuitBreaker.onError(0, TimeUnit.MILLISECONDS, e)
+
                     when (e.cause) {
                         is SocketTimeoutException -> logger.error(
                             "[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId",
                             e
                         )
-
                         else -> logger.error(
                             "[$accountName] Payment failed for txId: $transactionId, payment: $paymentId",
                             e
@@ -256,7 +292,6 @@ class PaymentExternalSystemAdapterImpl(
                 }
 
                 try {
-
                     val response = withTimeout(timeoutBudgetMs) {
                         client.sendAsync(request, HttpResponse.BodyHandlers.ofString()).await()
                     }
